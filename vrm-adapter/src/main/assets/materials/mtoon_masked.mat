@@ -1,0 +1,77 @@
+material {
+    name : MToon,
+    shadingModel : unlit,
+    doubleSided : true,
+    blending : masked,
+    parameters : [
+        {
+            name : baseColorFactor,
+            type : float4,
+            default : [1, 1, 1, 1]
+        },
+        {
+            name : shadeColorFactor,
+            type : float3,
+            default : [0, 0, 0]
+        },
+        {
+            name : shadingShift,
+            type : float,
+            default : 0.0
+        },
+        {
+            name : shadingToony,
+            type : float,
+            default : 0.95
+        },
+        {
+            name : lightDir,
+            type : float3,
+            default : [0, -0.2, 1]
+        },
+        {
+            name : baseColorMap,
+            type : sampler2d
+        },
+        {
+            name : shadeMap,
+            type : sampler2d
+        }
+    ],
+    requires : [
+        uv0
+    ]
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+
+        vec2 uv = getUV0();
+        vec4 base = texture(materialParams_baseColorMap, uv) * materialParams.baseColorFactor;
+        float alpha = base.a;
+
+        // 法线：必须用 getWorldTangentFrame()[2]（第三列=法线，第一列是切线）！
+        // unlit 材质没有 getWorldNormal()，只能用切线帧取第三列。
+        vec3 N = normalize(getWorldTangentFrame()[2]);
+        vec3 L = normalize(materialParams.lightDir);
+
+        // MToon cel 明暗：shadeRatio 0=暗 1=亮
+        float NdotL = dot(N, L);
+        float shadeRatio = clamp(NdotL * 0.5 + 0.5 + materialParams.shadingShift, 0.0, 1.0);
+        float toony = clamp(materialParams.shadingToony, 0.0, 1.0);
+        float lit = pow(shadeRatio, 1.0 - toony * 0.95);
+        float boundary = smoothstep(0.4, 0.6, shadeRatio);
+        lit = mix(lit, boundary, toony);
+
+        // shade 色：factor * shadeMap（clamp 避免透明区 RGB 黑把色压死）
+        vec3 shadeColor = materialParams.shadeColorFactor;
+        vec4 shadeMapColor = texture(materialParams_shadeMap, uv);
+        shadeColor = shadeColor * clamp(shadeMapColor.rgb, 0.0, 1.0);
+
+        // 明暗插值：亮部 base，暗部 shade
+        vec3 color = mix(shadeColor, base.rgb, lit);
+
+        material.baseColor = vec4(color, alpha);
+    }
+}

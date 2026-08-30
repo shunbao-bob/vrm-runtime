@@ -1,0 +1,13 @@
+
+# build outputs
+# crash dumps & IDE/caches
+*.apk
+.gradle/
+.idea/
+.kotlin/
+app/build/
+build/
+hs_err_*.log
+replay_pid*.log
+vrm-adapter/build/
+vrm-core/build/
