@@ -317,42 +317,6 @@ ResetPose / ResetExpression / StopVrma / StopSequence / RawPose / RawExpression�
   ModelNode 重建、无 reload 窗口期，天然无 SIGSEGV。烘焙通道（`VrmaBake`/
   `loadModelWithClips`/`switchClip`）已删除。
 
-## 切模型后 pose 混乱：根因与方案
-
-### 现象
-- **首次加载**任意模型 → 姿态正确（gltfio 的 bind pose，作者烘焙的站姿）。
-- **切换一次模型**（主 demo 的模型选择器或 `dev.vrm.runtime.demo.SWITCH` 广播）→ **新模型的静止姿态歪曲/乱套**（手/腿非自然，尤其大腿、手臂明显）；但 face 大方向、且**播放该模型的 VRMA 动画时姿态又正常**。
-
-### 根因（不是"写入失效"，是"identity NLR 写回模型 rest local"）
-主 demo 切换模型入口原先在 `loadModel(新模型)` 之后执行 `avatar.execute(AvatarCommand.Reset)`：
-
-- `Reset` → `AvatarEngineController.reset()` → `humanoid.resetNormalizedPose()`（把 55 个**归一化 rig 骨骼的 quaternion 全置 identity**）→ `humanoid.update()`。
-- `update()` 用 VRM 1.0 归一化重定向公式写回骨骼局部旋转：`PoseForB = L · W⁻¹ · NLR · W`。当 **NLR = identity** 时退化为 `L · W⁻¹ · W = L`，即把每个骨骼的局部旋转写回 **GLB 里的 rest local rotation**。
-- 问题：**VRoid / xlunar 这类模型的 rest 是 A-pose，rest local 带大旋转**（实测 VRoid_Sample_B/C 的 `J_Bip_L_UpperLeg` rest local 绕 X ~170°，quat≈(0.996,-0.03,-0.026,0.08)）；而 gltfio 的蒙皮/joint 父链是它自己重算的 bind 树，**与 GLB rest 的父链不一致**。把"GLB rest local"挂到 "gltfio bind 父链"上 → 腿部/手臂的 world 朝向就偏了，视觉上"乱套"。
-
-日志佐证（`AvatarEngine`）：
-- 切换后 `DIAG initial-rot-BEFORE-reset: leftUpperLeg=(1.00,-0.03,-0.03,0.08)` —— **正是 GLB rest local**（与 `glb_inspect`/单测读出的 rest 值完全一致）。
-- 但 `DIAG world:` 里 hips/feet 的**世界坐标一直正常**（脚在 y=0.14，站立合理）—— 因为 DIAG 读的是 headless `liveStore`（GLB 数学），读不到 gltfio 真实渲染值。
-- `leftUpperLeg` 对父（hips）的世界旋转极敏感（L 绕 X 170°），父链偏差被放大成视觉大偏移；而 arm 的 rest L 接近 identity，对父旋转不敏感，所以手看着还行。这解释了"为什么腿歪最明显"。
-- 播放 VRMA 时每帧用**真实的非身份 NLR** 覆盖写（重定向后的实际姿态），即使某条父链有误差也只是叠加成相对旋转，视觉被"压住"→ 动画正常。
-
-**结论：`avatar.reset()`/`resetNormalizedPose()` 对 VRoid 这类"非 T-pose rest + 大局部旋转"的模型是**危险的**：它把骨骼强制写回 GLB rest local，一旦 gltfio 父链与 GLB 不一致就整个骨架歪。首次加载不 reset（骨骼保持 gltfio bind pose）所以对。
-
-### 当前采用的方案（推荐，已生效）
-**主 demo 切换模型的入口不再调 `AvatarCommand.Reset`，保持 gltfio bind pose（同首次加载）。**
-- 改 `app/.../VrmDemoScreen.kt` 两处（`SWITCH` 广播分支 + UI 模型 Tab 点击分支），删掉 `renderer.avatar?.execute(AvatarCommand.Reset)`。
-- 效果：切模型后骨骼停留在 gltfio 的 bind pose（首次加载那样），站姿自然；若切换前有 VRMA，切模型会保留当前动画继续播，姿态也正常。
-- 验证：装机后切换 VRoid B/C / Seed-san 等，静止姿态正常；logcat 无 `EVENT reset`。
-
-> 说明：人工"Reset 姿态"按钮（`onReset`，走 `avatar?.reset()`）仍保留，它是用户显式触发的，不属于切模型入口，不受本次改动影响。
-
-### 可选的其他方案（为什么暂不采用）
-1. **切换后用 `SetPose("relaxed")` 而非 Reset**：`relaxed` 是明确的手臂/站姿数值（spine + left/rightUpperArm rotZ ±78），走 **normalized 通道显式覆盖**，而不是"写回各模型 rest local"。它从不触发"写回 GLB rest local"这条坑路。主 demo 因为希望"切完保留各模型作者站姿"而选了上文"当前采用的方案"（保持 bind pose），故未用它。
-   - 优点：统一站姿、可跨模型一致；缺点：失去各模型作者的原站姿差异，且 `relaxed` 只控制上/躯干，不控制腿（腿部仍靠 bind）。
-2. **把 `resetNormalizedPose` 真正语义改为"归一化 T-pose"**：让 identity NLR 写回的是归一化 T-pose 而非 GLB rest local。这需要改造 `VRMHumanoidRig.update()` 的 rest 补偿（如不让 `L·W⁻¹·N·W` 在 N=I 时回落成 L，而让 normalized rig 的 rest 就是 T-pose）。这是更复杂的引擎层修改，且与 three-vrm 的"consistent pose 映射回 rest"语义冲突，风险高、收益低（不解决跨模型的不一致），未采用。
-3. **根链对齐修复**：让 gltfio 与 GLB 的**父链/根链一致**（修 `Root→Global→Position→Hips` 链的施加），这样写回 rest local 也能正确呈现。这是最"治本"的方案，但需要在 gltfio 层修正骨架根合并，工程量大且属引擎层改动，暂未做（当前方案已满足需求）。
-
----
 
 - **VRoid 头发"盖脸"根因：lookAt 持续转头 + 烘焙 hair-lock 只锁局部 rest**。
   烘焙 clip 只含 humanoid 骨，springbone 关节（VRoid_B 的 47 根 HairJoint）不在 clip
