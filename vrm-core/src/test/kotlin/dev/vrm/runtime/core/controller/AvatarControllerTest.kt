@@ -1,5 +1,6 @@
 package dev.vrm.runtime.core.controller
 
+import org.junit.jupiter.api.Assertions.assertDoesNotThrow
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
@@ -9,6 +10,8 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 /**
@@ -179,6 +182,95 @@ class AvatarControllerTest {
         assertTrue(starts.await(3, TimeUnit.SECONDS))
         assertTrue(completes.await(3, TimeUnit.SECONDS))
         assertFalse(controller.currentState.queueRunning)
+    }
+
+    @Test
+    @Timeout(10)
+    fun `queue dispatches binding state and command events on host thread in order`() {
+        val binding = RecordingBinding()
+        val host = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "avatar-host") }
+        try {
+            val controller = AvatarController(binding, config) { host.execute(it) }
+            val commandThreads = CopyOnWriteArrayList<String>()
+            val queueEventThreads = CopyOnWriteArrayList<String>()
+            val done = CountDownLatch(1)
+            controller.on(AvatarEventType.COMMAND) { commandThreads += Thread.currentThread().name }
+            controller.on(AvatarEventType.QUEUE_START) { queueEventThreads += Thread.currentThread().name }
+            controller.on(AvatarEventType.STATE_CHANGE) {
+                if ((it.data["state"] as AvatarState).queueRunning) {
+                    queueEventThreads += Thread.currentThread().name
+                }
+            }
+            controller.on(AvatarEventType.QUEUE_COMPLETE) { done.countDown() }
+
+            controller.queue(
+                listOf(
+                    AvatarCommand.SetExpression("happy"),
+                    AvatarCommand.SetExpression("sad"),
+                ),
+            )
+
+            assertTrue(done.await(5, TimeUnit.SECONDS))
+            assertEquals(listOf("setExpression:happy", "setExpression:sad"), binding.calls)
+            assertTrue(commandThreads.isNotEmpty() && commandThreads.all { it == "avatar-host" })
+            assertTrue(queueEventThreads.isNotEmpty() && queueEventThreads.all { it == "avatar-host" })
+        } finally {
+            host.shutdownNow()
+        }
+    }
+
+    @Test
+    @Timeout(10)
+    fun `aborted queue cannot execute an already posted stale command`() {
+        val binding = RecordingBinding()
+        val hostTasks = LinkedBlockingQueue<() -> Unit>()
+        val controller = AvatarController(binding, config) { hostTasks.put(it) }
+
+        controller.queue(listOf(AvatarCommand.SetExpression("happy")))
+        hostTasks.poll(2, TimeUnit.SECONDS)!!.invoke() // stale abort cleanup
+        hostTasks.poll(2, TimeUnit.SECONDS)!!.invoke() // queue start
+        val postedCommand = hostTasks.poll(2, TimeUnit.SECONDS)!!
+
+        controller.abortQueue()
+        postedCommand.invoke()
+        hostTasks.poll(2, TimeUnit.SECONDS)!!.invoke() // abort cleanup
+
+        assertTrue(binding.calls.isEmpty(), "a command posted by an aborted generation must be ignored")
+        assertFalse(controller.currentState.queueRunning)
+        assertEquals(0, controller.currentState.queueLength)
+    }
+
+    @Test
+    fun `queue start listener failure leaves queue stopped`() {
+        val binding = RecordingBinding()
+        val hostTasks = LinkedBlockingQueue<() -> Unit>()
+        val controller = AvatarController(binding, config) { hostTasks.put(it) }
+        controller.on(AvatarEventType.STATE_CHANGE) { event ->
+            if ((event.data["state"] as AvatarState).queueRunning) {
+                throw AssertionError("queue start listener failed")
+            }
+        }
+
+        controller.queue(listOf(AvatarCommand.SetExpression("happy")))
+        hostTasks.remove().invoke() // stale abort cleanup
+        val queueStart = hostTasks.remove()
+
+        assertDoesNotThrow { queueStart.invoke() }
+        assertFalse(controller.currentState.queueRunning)
+        assertEquals(0, controller.currentState.queueLength)
+        assertTrue(binding.calls.isEmpty())
+    }
+
+    @Test
+    fun `rejected queue dispatcher leaves queue stopped`() {
+        val binding = RecordingBinding()
+        val controller = AvatarController(binding, config) { throw IllegalStateException("host closed") }
+
+        controller.queue(listOf(AvatarCommand.SetExpression("happy")))
+
+        assertTrue(binding.calls.isEmpty())
+        assertFalse(controller.currentState.queueRunning)
+        assertEquals(0, controller.currentState.queueLength)
     }
 
     @Test

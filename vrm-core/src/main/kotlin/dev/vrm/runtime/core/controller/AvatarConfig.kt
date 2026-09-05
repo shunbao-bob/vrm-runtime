@@ -33,6 +33,9 @@ data class AvatarConfig(
 
     /** Choreography sequences (ordered command lists). */
     val sequences: List<SequencePreset> = emptyList(),
+
+    /** Named world-space anchors (destinations for MoveToAnchor). */
+    val anchors: List<AnchorPreset> = emptyList(),
 ) {
     companion object {
         /** An empty config usable when commands always carry raw sources. */
@@ -48,6 +51,7 @@ data class AvatarConfig(
     fun handGestureById(id: String): NamedPreset? = handGestures.firstOrNull { it.id == id }
     fun bodyGestureById(id: String): NamedPreset? = bodyGestures.firstOrNull { it.id == id }
     fun bodyMotionById(id: String): NamedPreset? = bodyMotions.firstOrNull { it.id == id }
+    fun anchorById(id: String): AnchorPreset? = anchors.firstOrNull { it.id == id }
 
     // ---- validators (throw on unknown id) ----
     fun requirePose(id: String) = require(poseById(id) != null) { "Unknown pose: $id" }
@@ -56,6 +60,7 @@ data class AvatarConfig(
     fun requireBodyMotion(id: String) = require(bodyMotionById(id) != null) { "Unknown body motion: $id" }
     fun requireExpression(id: String) = require(expressionById(id) != null) { "Unknown expression: $id" }
     fun requireSequence(id: String) = require(sequenceById(id) != null) { "Unknown sequence: $id" }
+    fun requireAnchor(id: String) = require(anchorById(id) != null) { "Unknown anchor: $id" }
 }
 
 /** A selectable VRM 1.0 model. */
@@ -107,4 +112,14 @@ data class SequencePreset(
     val name: String,
     val commands: List<AvatarCommand>,
     val description: String = "",
+)
+
+/** A named world-space destination (for AvatarCommand.MoveToAnchor). */
+data class AnchorPreset(
+    val id: String,
+    val name: String,
+    val x: Float,
+    val y: Float,
+    val z: Float,
+    val arrivalRadius: Float = 0.15f,
 )

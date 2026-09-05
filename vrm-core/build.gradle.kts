@@ -43,6 +43,14 @@ publishing {
             artifactId = "vrm-core"
             version = project.version.toString()
             from(components["java"])
+            pom {
+                name.set("vrm-core")
+                description.set(
+                    "Engine-agnostic VRM 1.0 core: GLB/glTF parsing, humanoid rig, " +
+                        "MToon material params, spring bones, expressions, look-at, " +
+                        "VRMA animation, and the AvatarController command facade."
+                )
+            }
         }
     }
 }

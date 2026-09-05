@@ -1,6 +1,8 @@
 package dev.vrm.runtime.adapter
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import com.google.android.filament.Engine
 import dev.vrm.runtime.core.controller.AvatarConfig
 import dev.vrm.runtime.core.controller.AvatarController
@@ -40,6 +42,27 @@ class AvatarRenderer(
      *  default PBR with the matc-precompiled unlit cel material). */
     var mtoonEnabled: Boolean = true
 
+    /** The active MToon applier (owns Filament materials/instances). Must be
+     *  destroyed explicitly before the ModelNode, or a GC finalizer may destroy
+     *  a Material while its MaterialInstances are still alive -> SIGABRT. */
+    private var mtoonApplier: dev.vrm.runtime.adapter.filament.MToonMaterialApplier? = null
+    private val loadLifecycle = AvatarLoadLifecycle()
+
+    /** Set on destroy; update() short-circuits so a lingering SceneView onFrame
+     *  cannot write transforms onto already-freed Filament entities. */
+    @Volatile
+    private var destroyed: Boolean = false
+
+    /** Mark for teardown WITHOUT freeing resources. Call from a parent-scope
+     *  DisposableEffect that runs BEFORE the Scene's own disposal (SceneView
+     *  frees the model node's Filament entities on its own onDispose; if a
+     *  stale onFrame then fires, spring-bone writes would touch freed memory
+     *  -> SIGSEGV). After this, [update] is a no-op. */
+    fun prepareDestroy() {
+        destroyed = true
+        loadLifecycle.destroy()
+    }
+
     /** The scene model node for the currently loaded avatar, or null. */
     var modelNode: ModelNode? = null
         private set
@@ -52,11 +75,14 @@ class AvatarRenderer(
     var avatar: AvatarController? = null
         private set
 
-    /** Stage / lighting configuration applied on each [loadModel]. */
+    /** Stage / lighting configuration applied on each [loadModel]. Set via
+     *  [applyStage] (which also propagates to the engine); read-only here. */
     var stage: StageConfig = StageConfig.XLUNAR_DEFAULT
+        private set
 
-    /** Directional light node added to the scene (single persistent light). */
-    var lightNode: io.github.sceneview.node.LightNode? = null
+    /** Directional light node added to the scene (single persistent light).
+     *  Internal: owned by this renderer, created in [createOrUpdateLight]. */
+    private var lightNode: io.github.sceneview.node.LightNode? = null
 
     /** Current model source key (null when no model loaded). */
     var currentModelSource: String? = null
@@ -77,6 +103,10 @@ class AvatarRenderer(
      *   the skin). Changing it reloads the model with the new embedded clip.
      */
     fun loadModel(source: String, animationSource: String? = null) {
+        check(Looper.myLooper() == Looper.getMainLooper()) {
+            "AvatarRenderer.loadModel must run on the main thread; use loadModelAsync otherwise"
+        }
+        val token = loadLifecycle.beginLoad()
         val bytes = assetResolver(source) ?: throw IllegalArgumentException(
             "AvatarRenderer: cannot resolve asset source: $source"
         )
@@ -89,7 +119,7 @@ class AvatarRenderer(
         // rewrite + reload per animation) and enables pose/animation/spring/
         // lookAt all through the same bone-write path.
         val instance = modelLoader.createModelInstance(assetFileLocation = source)
-        applyLoaded(source, bytes, instance, animationSource)
+        if (!applyLoaded(source, bytes, instance, animationSource, token)) return
 
         // If an animation was requested, play it live via the VRMA player.
         if (animationSource != null) {
@@ -112,6 +142,7 @@ class AvatarRenderer(
      * synchronous loadModel blocked the main thread >5s under input.
      */
     fun loadModelAsync(source: String, onLoaded: () -> Unit) {
+        val token = loadLifecycle.beginLoad()
         android.util.Log.d("AvatarEngine", "loadModelAsync start source=$source")
         modelLoader.loadModelInstanceAsync(
             fileLocation = source,
@@ -121,12 +152,26 @@ class AvatarRenderer(
                     android.util.Log.e("AvatarEngine", "loadModelAsync: null instance for $source")
                     return@loadModelInstanceAsync
                 }
-                val bytes = assetResolver(source) ?: run {
-                    android.util.Log.e("AvatarEngine", "loadModelAsync: cannot resolve asset: $source")
-                    return@loadModelInstanceAsync
+
+                // CRITICAL: gltfio's onResult may fire on a background thread. All
+                // Filament work in applyLoaded (ModelNode, TransformManager, spring
+                // bones) MUST run on the main thread to stay serialized with the
+                // SceneView onFrame that drives renderer.update() every frame.
+                // Doing it on a background thread racies with the render thread and
+                // writes spring-bone rotations to half-built/freed entities -> SIGSEGV.
+                Handler(Looper.getMainLooper()).post {
+                    if (!loadLifecycle.mayApply(token)) {
+                        releaseUnattachedInstance(instance)
+                        return@post
+                    }
+                    val bytes = assetResolver(source)
+                    if (bytes == null) {
+                        android.util.Log.e("AvatarEngine", "loadModelAsync: cannot resolve asset: $source")
+                        releaseUnattachedInstance(instance)
+                        return@post
+                    }
+                    if (applyLoaded(source, bytes, instance, null, token)) onLoaded()
                 }
-                applyLoaded(source, bytes, instance, null)
-                onLoaded()
             },
         )
     }
@@ -219,7 +264,12 @@ class AvatarRenderer(
         loadBytes: ByteArray,
         instance: io.github.sceneview.model.ModelInstance,
         animationSource: String?,
-    ) {
+        token: Long,
+    ): Boolean {
+        if (!loadLifecycle.mayApply(token)) {
+            releaseUnattachedInstance(instance)
+            return false
+        }
         // Build the NEW node + controller FIRST, then swap references and only
         // destroy the old ones afterwards. This avoids a window where the render
         // thread touches a destroyed ModelNode/controller.
@@ -233,29 +283,66 @@ class AvatarRenderer(
         // (facing the camera) gets treated as back-facing and renders black.
         node.setCulling(false)
 
-        val controller = AvatarEngineController(
-            engine = engine,
-            asset = node.model,
-            instance = node.modelInstance,
-            gltfBytes = loadBytes,
-            assetResolver = assetResolver,
-            avatarConfig = avatarConfig,
-        )
+        val controller = try {
+            AvatarEngineController(
+                engine = engine,
+                asset = node.model,
+                instance = node.modelInstance,
+                gltfBytes = loadBytes,
+                assetResolver = assetResolver,
+                avatarConfig = avatarConfig,
+            )
+        } catch (t: Throwable) {
+            runCatching { node.destroy() }
+            throw t
+        }
+        // Bind the scene ModelNode so the locomotion layer can drive the
+        // whole-model world position / yaw (vrm-character's MoveTo/TurnTo/etc).
+        try {
+            controller.bindModelNode(node)
+        } catch (t: Throwable) {
+            AvatarLoadResources({ node.destroy() }, null, { controller.destroy() }).release()
+            throw t
+        }
 
         // Apply the MToon material (default on; binds textures by alphaMode;
         // turn off mtoonEnabled when tuning)
+        var newMtoonApplier: dev.vrm.runtime.adapter.filament.MToonMaterialApplier? = null
         if (mtoonEnabled) {
-            runCatching {
-                val opaque = context.assets.open("materials/mtoon_opaque.filamat").readBytes()
-                val masked = context.assets.open("materials/mtoon_masked.filamat").readBytes()
-                val transparent = context.assets.open("materials/mtoon_transparent.filamat").readBytes()
+            try {
+                val opaque = context.assets.open("materials/mtoon_opaque.filamat").use { it.readBytes() }
+                val masked = context.assets.open("materials/mtoon_masked.filamat").use { it.readBytes() }
+                val transparent = context.assets.open("materials/mtoon_transparent.filamat").use { it.readBytes() }
                 val filamat = dev.vrm.runtime.adapter.filament.MToonMaterialApplier.Filamat(opaque, masked, transparent)
                 val applier = dev.vrm.runtime.adapter.filament.MToonMaterialApplier(
-                    engine, node.modelInstance, controller.vrm.gltf, controller.vrm.binary
+                    engine, node.modelInstance, controller.vrm.gltf, controller.vrm.binary,
+                    // The MToon shader's lightDir points TOWARD the light; the stage
+                    // config holds the light PROPAGATION direction (the negation), so
+                    // mirror it — this keeps the cartoon shading tracking the host's
+                    // configured stage light instead of the mat's hardcoded default.
+                    lightDir = floatArrayOf(
+                                            -stage.directionalLightPosition[0],
+                                            -stage.directionalLightPosition[1],
+                                            -stage.directionalLightPosition[2],
+                                        ),
                 )
+                newMtoonApplier = applier
                 applier.apply(controller.vrm.mtoon, filamat, node.renderableNodes)
-            }.onFailure {
-                android.util.Log.w("AvatarEngine", "MToon apply failed: ${it.message}", it)
+            } catch (t: Throwable) {
+                android.util.Log.w("AvatarEngine", "MToon apply failed: ${t.message}", t)
+                // If an applier exists, apply() may already have replaced some
+                // renderables. Those MaterialInstances must remain alive until the
+                // ModelNode is destroyed, so partial application cannot fall back
+                // in-place to PBR safely; abandon this new model as one resource set.
+                val failedApplier = newMtoonApplier
+                if (failedApplier != null) {
+                    AvatarLoadResources(
+                        node = { node.destroy() },
+                        applier = { failedApplier.destroy() },
+                        controller = { controller.destroy() },
+                    ).release()
+                    return false
+                }
             }
         }
 
@@ -263,25 +350,61 @@ class AvatarRenderer(
         // Foot-bottom alignment: accumulate the world y of the foot bone chain from
         // the humanoid, then shift the model down so the feet align to y=0 (ground),
         // eliminating the visual "floating" feel.
-        val footBottomY = calculateFootBottomY(controller)
-        if (footBottomY != null && footBottomY > 0f) {
-            val groundOffset = -(footBottomY + 0.02f) // keep a 2cm margin to avoid clipping into the floor
-            node.position = io.github.sceneview.math.Position(y = groundOffset)
-            android.util.Log.d("AvatarEngine", "applyLoaded: footBottomY=$footBottomY groundOffset=$groundOffset")
-        }
+        runCatching {
+            val footBottomY = calculateFootBottomY(controller)
+            if (footBottomY != null && footBottomY > 0f) {
+                val groundOffset = -(footBottomY + 0.02f)
+                node.position = io.github.sceneview.math.Position(y = groundOffset)
+                android.util.Log.d("AvatarEngine", "applyLoaded: footBottomY=$footBottomY groundOffset=$groundOffset")
+            }
+        }.onFailure { android.util.Log.w("AvatarEngine", "foot alignment failed", it) }
 
         val oldNode = modelNode
         val oldController = engineController
-        modelNode = node
-        engineController = controller
-        avatar = AvatarController(controller, avatarConfig)
-        currentModelSource = source
-        currentAnimationSource = animationSource
+        val oldMtoonApplier = mtoonApplier
+        val newAvatar = try {
+            AvatarController(controller, avatarConfig) { task ->
+                if (Looper.myLooper() == Looper.getMainLooper()) task()
+                else check(Handler(Looper.getMainLooper()).post(task)) { "main looper rejected avatar command" }
+            }
+        } catch (t: Throwable) {
+            AvatarLoadResources({ node.destroy() }, newMtoonApplier?.let { { it.destroy() } }, { controller.destroy() }).release()
+            throw t
+        }
+        // beginLoad()/destroy() may be called from another thread while the main
+        // thread is constructing Filament resources. Re-check immediately before
+        // publication so a stale generation can never replace the current avatar.
+        val published = loadLifecycle.applyIfCurrent(token) {
+            modelNode = node
+            engineController = controller
+            mtoonApplier = newMtoonApplier
+            avatar = newAvatar
+            currentModelSource = source
+            currentAnimationSource = animationSource
+        }
+        if (!published) {
+            AvatarLoadResources(
+                node = { node.destroy() },
+                applier = newMtoonApplier?.let { { it.destroy() } },
+                controller = { controller.destroy() },
+            ).release()
+            return false
+        }
 
-        oldNode?.destroy()
-        oldController?.destroy()
+        AvatarLoadResources(
+            node = oldNode?.let { { it.destroy() } },
+            applier = oldMtoonApplier?.let { { it.destroy() } },
+            controller = oldController?.let { { it.destroy() } },
+        ).release()
 
         applyStage(stage)
+        return true
+    }
+
+    /** Release a decoded instance that lost an async generation race before attachment. */
+    private fun releaseUnattachedInstance(instance: io.github.sceneview.model.ModelInstance) {
+        runCatching { ModelNode(modelInstance = instance, scaleToUnits = 1.0f).destroy() }
+            .onFailure { android.util.Log.w("AvatarEngine", "discard stale model failed", it) }
     }
 
     /**
@@ -350,16 +473,31 @@ class AvatarRenderer(
      * Advance the avatar simulation. Call every frame on the main thread.
      */
     fun update(deltaSeconds: Float) {
+        if (destroyed) return
         engineController?.update(deltaSeconds)
+        mtoonApplier?.update(deltaSeconds)
     }
 
     /** Tear down the model node + controllers. */
     fun destroy() {
-        modelNode?.destroy()
+        // Stop per-frame updates first so a lingering SceneView onFrame cannot
+        // write transforms onto entities we are about to free (spring-bone SIGSEGV).
+        destroyed = true
+        loadLifecycle.destroy()
+        // Destroy the MToon materials/instances AFTER the ModelNode (renderables
+        // that reference them are gone by then), and BEFORE any GC finalizer can
+        // touch them out of order (a Material destroyed while its instances are
+        // still alive -> Filament PreconditionPanic -> SIGABRT).
+        AvatarLoadResources(
+            node = modelNode?.let { { it.destroy() } },
+            applier = mtoonApplier?.let { { it.destroy() } },
+            controller = engineController?.let { { it.destroy() } },
+        ).release()
         modelNode = null
-        engineController?.destroy()
+        mtoonApplier = null
         engineController = null
         avatar = null
         currentModelSource = null
+        currentAnimationSource = null
     }
 }

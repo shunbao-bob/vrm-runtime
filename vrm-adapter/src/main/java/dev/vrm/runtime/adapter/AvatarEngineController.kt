@@ -22,12 +22,20 @@ import dev.vrm.runtime.core.lookAt.VrmLookAt
 import dev.vrm.runtime.core.lookAt.VrmLookAtLoader
 import dev.vrm.runtime.core.math.Quat
 import dev.vrm.runtime.core.math.Vec3
+import dev.vrm.runtime.core.motion.MotionSpec
+import dev.vrm.runtime.core.motion.MotionSpecClipBuilder
+import dev.vrm.runtime.core.motion.MotionSpecValidator
 import dev.vrm.runtime.core.springbone.SpringBoneLoader
 import dev.vrm.runtime.core.springbone.SpringBoneManager
 import dev.vrm.runtime.core.vrma.VRMAnimationClipBuilder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import io.github.sceneview.node.ModelNode
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * The Filament-backed engine controller for one loaded avatar. It implements
@@ -37,6 +45,20 @@ import kotlin.math.sin
  * This is the heart of the `vrm-adapter` library: it owns the Filament
  * TransformManager / RenderableManager bindings, the humanoid / expressions /
  * lookAt / spring-bone controllers, and per-frame [update].
+ *
+ * ── INTERNAL USE ONLY ─────────────────────────────────────────────
+ * This class is the implementation detail behind [AvatarRenderer]: it is kept
+ * `public` because [AvatarRenderer] (its sole legitimate owner) must be able to
+ * hand out the live `engineController` for per-frame access (spring bones,
+ * look-at, mouth, locomotion state). External consumers should treat it as
+ * internal and avoid constructing it directly — the supported entry point is
+ * [AvatarRenderer] (loadModel / applyStage / avatar). Callers who hold a
+ * reference returned by `renderer.engineController` must respect its lifecycle
+ * (it is destroyed with the renderer) and call its methods on the main thread.
+ * The low-level Filament entities it exposes (`asset` / `instance` /
+ * `humanoid` / `lookAt` / `springManager`) are for advanced debugging use
+ * only and their contents may change without warning.
+ * ────────────────────────────────────────────────────────────────
  *
  * @param assetResolver resolves an asset source key (e.g. "animations/wave.vrma")
  *   to raw bytes (from assets / file / network).
@@ -52,6 +74,104 @@ class AvatarEngineController(
 
     private val logTag = "AvatarEngine"
     val vrm = dev.vrm.runtime.core.vrm.VrmLoader.load(gltfBytes)
+
+    // ── Whole-body locomotion state (vrm-character layer drives via commands) ──
+    /** The SceneView model node this avatar is attached to; locomotion writes
+     *  its world position / yaw each frame. Set via [bindModelNode]. */
+    private var modelNode: ModelNode? = null
+
+    /** Current world XZ of the model node (locomotion integration state). */
+    private var locX = 0f
+    /** Current world Z of the model node. */
+    private var locZ = 0f
+    /** Current facing yaw in degrees around +Y (0 = facing +Z). */
+    private var locYawDeg = 0f
+
+    /** Offset (deg) between the locomotion's assumed +Z forward and the
+     *  model's ACTUAL visual forward. VRM files often bake a root rotation
+     *  (e.g. 180 deg), so the avatar's face does NOT point along +Z when the
+     *  node yaw is 0. Derived once from the head bone's world orientation
+     *  (LookAt's faceFront=+Z convention). Travel / turn use
+     *  locYawDeg + facingOffsetDeg so the whole body walks straight forward.
+     *  visualYaw = locYawDeg + facingOffsetDeg = where the face points. */
+    private var facingOffsetDeg = 0f
+
+    /** Actual visual forward (degrees around +Y) read back from the model
+     *  node's world quaternion after applying the yaw. This is the ground
+     *  truth of where the avatar's face points, decoupled from any euler/
+     *  RotationsOrder convention. Locomotion travels along THIS so feet /
+     *  body / gaze all stay aligned. Updated in [applyNodeTransform]. */
+    private var actualVisualYawDeg = 0f
+
+    /** Desired yaw target the feedback loop is driving toward, or null. */
+    private var visualTargetDeg: Float? = null
+    /** Current locomotion speed (units/s), used by the speed→state machine. */
+    private var locSpeed = 0f
+    /** Active move target XZ, or null when not moving. */
+    private var moveTarget: Pair<Float, Float>? = null
+    private var moveSpeed = 1.5f
+    private var arrivalRadius = 0.15f
+    private var stopDeceleration = 0f
+    private var turnTargetDeg: Float? = null
+    private var turnSpeedDegPerSec = 180f
+    /** Below this measured yaw error (deg) the turn feedback stops — kills
+     *  the read-noise wobble around the target. */
+    private val TURN_DEAD_ZONE_DEG = 1.5f
+    /** Low-passed visual yaw used as the travel direction. */
+    private var travelYawSm = 0f
+    /** Last non-zero displacement direction, retained for physically continuous braking. */
+    private var lastMoveDirection = LocomotionMath.Direction(0f, 1f)
+    /** Locomotion clip mapping (consumed by the animation state machine). */
+    private var locIdleClip: String? = null
+    private var locWalkClip: String? = null
+    private var locRunClip: String? = null
+    private var activeLocClip: String? = null
+    private var maxWalkSpeed = 1.5f
+    private var maxRunSpeed = 3.2f
+
+    /** Attach the SceneView model node so locomotion can drive its transform. */
+    fun bindModelNode(node: ModelNode?) {
+        modelNode = node
+        if (node != null) {
+            locX = node.position.x
+            locYawDeg = 0f
+            locZ = node.position.z
+            facingOffsetDeg = computeFacingOffsetDeg()
+            actualVisualYawDeg = normalizeYaw(LocomotionMath.visualYaw(readVisualForwardDeg(node), facingOffsetDeg))
+            Log.i(logTag, "facingOffset=$facingOffsetDeg deg visualForward vs +Z")
+        }
+    }
+
+    /** True visual forward = face direction in world XZ, as an angle relative
+     *  to +Z, derived from the head bone's world orientation (LookAt uses the
+     *  same faceFront=+Z convention). When the VRM's root carries a baked
+     *  rotation this is non-zero and travel must compensate it. */
+    private fun computeFacingOffsetDeg(): Float {
+        val h = humanoid ?: return 0f
+        val headIdx = h.getRawBoneNodeIndex(dev.vrm.runtime.core.humanoid.HumanBoneName.HEAD) ?: return 0f
+        val m = h.rawStore.getWorldMatrix(headIdx)
+        val p = dev.vrm.runtime.core.math.Vec3()
+        val q = dev.vrm.runtime.core.math.Quat()
+        val s = dev.vrm.runtime.core.math.Vec3()
+        m.decompose(p, q, s)
+        val front = q.rotate(dev.vrm.runtime.core.math.Vec3(0f, 0f, 1f))
+        val fx = front.x
+        val fz = front.z
+        if (fx * fx + fz * fz < 1e-6f) return 0f
+        return (kotlin.math.atan2(fx, fz) * 180f / kotlin.math.PI.toFloat())
+    }
+
+    /** The yaw the FACE actually points at (visual forward), world degrees. */
+    private fun visualYawDeg(): Float = locYawDeg + facingOffsetDeg
+    /** Current world XZ (for the character layer's collision queries). */
+    fun getLocomotionXZ(): Pair<Float, Float> = locX to locZ
+    /** Current facing yaw in degrees (visual forward, face direction) for
+     *  the character layer / walkHome waypoints. */
+    fun getLocomotionYaw(): Float = actualVisualYawDeg
+    /** Current speed (units/s). */
+    fun getLocomotionSpeed(): Float = locSpeed
+    /** True while a MoveTo target is active. */
+    fun isMoving(): Boolean = moveTarget != null
 
     init {
         Log.i(logTag, "parsed VRM: meta=${vrm.vrm?.meta?.name} " +
@@ -109,6 +229,11 @@ class AvatarEngineController(
     /** Whether spring-bone physics are enabled this frame. */
     var springBoneEnabled: Boolean = true
 
+    /** Set by [destroy]; update() short-circuits so a stale onFrame cannot write
+     *  onto Filament entities the owning ModelNode already freed. */
+    @Volatile
+    private var destroyed: Boolean = false
+
     /** Whether the look-at controller is active this frame. */
     var lookAtEnabled: Boolean = true
 
@@ -121,6 +246,10 @@ class AvatarEngineController(
     private var vrmaPrevPlayer: VrmAnimationPlayer? = null
     private var vrmaPrevWeight: Float = 1f
     private var vrmaNextWeight: Float = 1f
+    /** True while a brand-new clip fades IN from the idle stance (no previous
+     *  playing clip to cross-fade from). During this window the idle body-motion
+     *  layer stays active so the ramp starts from a live pose, not a snap. */
+    private var fadeInFromIdle: Boolean = false
 
     /** Main-thread choreography state for Pose/Combos presets. */
     private var sequenceCommands: List<AvatarCommand> = emptyList()
@@ -128,6 +257,37 @@ class AvatarEngineController(
     private var sequenceWaitMillis = 0f
     private var bodyMotionId: String? = null
     private var bodyMotionClock = 0f
+
+    // ── RANDOM IDLE (09-03): naturalistic idle layer. While bodyMotionId ==
+    // "idleNatural" (no VRMA / no explicit motion) this drives a subtle breathing
+    // sway + random blinks + occasional head/arm micro-moves, so the avatar never
+    // stands frozen and never repeats a fixed 4s loop. When [listeningActive] is
+    // set (STT mic open) micro-moves pause and only breathing + lip-sync remain.
+    @Volatile
+    var listeningActive: Boolean = false
+
+    /** Freeze random idle while TTS is broadcasting (09-05): during lip-sync the
+     *  LLM-picked expression must not fight random blinks / hair-fixing-like
+     *  micro-moves — only breathing sway + lip-sync remain. */
+    @Volatile
+    var speakingActive: Boolean = false
+
+    private val idleRand = java.util.Random()
+
+    /** Seconds until the next random blink (re-rolled after each blink). */
+    private var idleBlinkTimer = 2.5f + idleRand.nextFloat() * 3.5f
+
+    /** Blink envelope phase: <0 inactive, [0, 1] active (close->hold->open). */
+    private var idleBlinkPhase = -1f
+
+    /** Seconds until the next random micro-move (re-rolled after each move). */
+    private var idleActionTimer = 6f + idleRand.nextFloat() * 9f
+
+    /** Active micro-move type: -1 none, 0 look-left, 1 look-right, 2 shrug, 3 tilt-head. */
+    private var idleActionType = -1
+
+    /** Progress (0..1) of the current micro-move envelope. */
+    private var idleActionProgress = 0f
 
     /** The currently set expression name (null = neutral). */
     var activeExpression: String? = null
@@ -243,6 +403,92 @@ class AvatarEngineController(
     // AvatarBinding implementation
     // ==========================================================================
 
+    override fun moveTo(x: Float, z: Float, y: Float, speed: Float, arrivalRadius: Float) {
+        if (!x.isFinite() || !z.isFinite() || !speed.isFinite() || speed <= 0f ||
+            !arrivalRadius.isFinite() || arrivalRadius < 0f) return
+        // Recovery: if the avatar drifted out of the scene bounds (spiral
+        // bug residue), teleport it back near the origin before moving.
+        if (kotlin.math.abs(locX) > 10f || kotlin.math.abs(locZ) > 10f) {
+            Log.w(logTag, "moveTo: out-of-bounds pos=($locX,$locZ) -> teleport to (0,0)")
+            locX = 0f
+            locZ = 0f
+            travelYawSm = 0f
+        }
+        moveTarget = x to z
+        moveSpeed = speed
+        stopDeceleration = 0f
+        this.arrivalRadius = arrivalRadius
+        // Face the destination first (progressive turn), so the body turns
+        // before walking - movement then follows the body yaw, not a straight
+        // line to the point (fixes diagonal sliding when facing is stale).
+        val dx = x - locX
+        val dz = z - locZ
+        if (dx * dx + dz * dz > 0.0001f) {
+            // Desired face (visual) direction to the target, minus the baked
+            // root offset => the node yaw to aim at.
+            turnTargetDeg = (atan2(dx, dz) * 180f / PI).toFloat()
+        }
+        Log.i(logTag, "EVENT moveTo target=($x,$z) speed=$speed radius=$arrivalRadius")
+    }
+
+    override fun turnTo(yawDegrees: Float, turnSpeedDegPerSec: Float) {
+        if (!yawDegrees.isFinite() || !turnSpeedDegPerSec.isFinite() || turnSpeedDegPerSec <= 0f) return
+        turnTargetDeg = yawDegrees
+        this.turnSpeedDegPerSec = turnSpeedDegPerSec
+        Log.i(logTag, "EVENT turnTo yaw=$yawDegrees deg")
+    }
+
+    override fun setWorldTransform(x: Float, y: Float, z: Float, yawDegrees: Float) {
+        if (!x.isFinite() || !y.isFinite() || !z.isFinite() || !yawDegrees.isFinite()) return
+        locX = x; locZ = z; locYawDeg = LocomotionMath.nodeYawForVisual(yawDegrees, facingOffsetDeg)
+        moveTarget = null; turnTargetDeg = null
+        applyNodeTransform(y)
+        Log.i(logTag, "EVENT setWorldTransform pos=($x,$y,$z) yaw=$yawDegrees")
+    }
+
+    override fun stopMove(deceleration: Float) {
+        moveTarget = null
+        turnTargetDeg = null
+        stopDeceleration = if (deceleration.isFinite() && deceleration > 0f && locSpeed > 0f) {
+            LocomotionMath.decelerationForDuration(locSpeed, deceleration)
+        } else {
+            0f
+        }
+        if (stopDeceleration == 0f) locSpeed = 0f
+        Log.i(logTag, "EVENT stopMove decel=$deceleration")
+    }
+
+    override fun setLocomotion(
+        idle: String?, walk: String?, run: String?,
+        maxWalkSpeed: Float, maxRunSpeed: Float,
+    ) {
+        if (!maxWalkSpeed.isFinite() || !maxRunSpeed.isFinite() ||
+            maxWalkSpeed <= 0f || maxRunSpeed < maxWalkSpeed) return
+        locIdleClip = idle; locWalkClip = walk; locRunClip = run
+        this.maxWalkSpeed = maxWalkSpeed; this.maxRunSpeed = maxRunSpeed
+        activeLocClip = null
+        Log.i(logTag, "EVENT setLocomotion idle=$idle walk=$walk run=$run")
+    }
+
+    override fun playMotionSpec(spec: MotionSpec, loop: Boolean) {
+        val h = humanoid ?: return
+        val em = expressionManager
+        val validated = try {
+            MotionSpecValidator.validate(spec)
+        } catch (e: IllegalArgumentException) {
+            Log.e(logTag, "playMotionSpec validation rejected: ${e.message}")
+            return
+        }
+        val clip = MotionSpecClipBuilder(h, em).build(validated)
+        val player = VrmAnimationPlayer(h, em, clip, lookAt)
+        installVrmaPlayer(player)
+        vrmaPlayer?.loop = loop
+        vrmaPlayer?.playing = true
+        activeVrmaSource = "spec:${validated.name}"
+        bodyMotionId = null
+        Log.i(logTag, "EVENT playMotionSpec name=${validated.name} dur=${"%.2f".format(clip.duration)} tracks=${clip.tracks.size} loop=$loop")
+    }
+
     override fun setPose(id: String?) {
         val h = humanoid ?: return
         if (id == null) {
@@ -299,10 +545,13 @@ class AvatarEngineController(
         Log.i(logTag, "EVENT playVrma source=$source loop=$loop")
         if (source == null) {
             activeVrmaSource = null
-            vrmaPlayer?.playing = false
+            // Fade out instead of freezing on the last sampled pose: a hard
+            // stop left the walk pose (legs mid-stride, arms out) baked into
+            // the normalized rig, and the idle layer + springbones pulling
+            // against it made the whole body wobble at every stop.
+            vrmaPlayer?.startFadeOut(0.3f)
             return
         }
-        bodyMotionId = null
         val bytes = assetResolver(source) ?: throw IllegalArgumentException(
             "playVrma: cannot resolve VRMA asset source: $source -- " +
                 "check the source key against the assetResolver you wired into AvatarEngineController"
@@ -401,11 +650,50 @@ class AvatarEngineController(
             "normHasSpine=${normKeys.contains("spine")}")
         val clip = VRMAnimationClipBuilder(animation, h, em).build()
         val player = VrmAnimationPlayer(h, em, clip, lookAt)
-        vrmaPlayer = player
+        installVrmaPlayer(player)
         Log.d(logTag, "loadVrma: clip tracks=${clip.tracks.size} dur=${clip.duration} " +
             "hasLookAt=${clip.tracks.any { it.name == "lookAt.quaternion" }}")
         Log.i(logTag, "EVENT loadVrma tracks=${clip.tracks.size} dur=${"%.2f".format(clip.duration)}")
         return player.duration
+    }
+
+    private fun installVrmaPlayer(player: VrmAnimationPlayer) {
+        val old = vrmaPlayer
+        val transition = AnimationPlayerOwnership.install(
+            previous = vrmaPrevPlayer,
+            current = old,
+            currentPlaying = old?.playing == true,
+            next = player,
+            clearOwnedExpressions = VrmAnimationPlayer::clearOwnedExpressions,
+        )
+        val previous = transition.previous
+        if (previous != null) {
+            // Clip→clip: cross-fade between the two players.
+            vrmaPrevPlayer = previous
+            vrmaFadeTimer = 0f
+            vrmaPrevWeight = 1f
+            vrmaNextWeight = 0f
+            player.blendWeight = 0f
+        } else if (old?.playing != true) {
+            // Clip→idle→new clip (or very first clip): there is no playing
+            // previous clip to cross-fade from, and the avatar is on the idle
+            // stance. Fade the new clip IN from blend 0 so we don't flash from
+            // idle into frame 0 at full weight. The idle body-motion layer keeps
+            // running underneath (bodyMotionId is not cleared yet) and shows
+            // through while the clip ramps up.
+            vrmaPrevPlayer = null
+            vrmaFadeTimer = 0f
+            vrmaPrevWeight = 0f
+            vrmaNextWeight = 0f
+            player.blendWeight = 0f
+            fadeInFromIdle = true
+        } else {
+            vrmaPrevPlayer = null
+            vrmaFadeTimer = -1f
+            player.blendWeight = 1f
+            fadeInFromIdle = false
+        }
+        vrmaPlayer = transition.current
     }
 
     /** Pause / resume the loaded VRMA clip. */
@@ -416,6 +704,11 @@ class AvatarEngineController(
     // ==========================================================================
         // Precise lip-sync driven by Aliyun TTS subtitle timestamps
     // ==========================================================================
+
+    /** Extra lead (ms) to shift mouth-sync ahead of audio playback start, so the
+     *  mouth opens as each sound is spoken rather than lagging. Tune on device:
+     *  too large → mouth moves before the voice; too small → lags. */
+    private val mouthStartLeadMs = 120L
 
     /**
      * Subtitle frame queue (thread-safe: the JNI callback thread enqueues,
@@ -454,19 +747,18 @@ class AvatarEngineController(
      */
     fun pushSubtitleFrame(frame: SubtitleFrame) {
         subtitleFrames.offer(frame)
-        // If playback has not truly started yet (markPlaybackStarted not called),
-        // use the first frame's arrival time as the timeline base so updateMouth
-        // can drive the mouth from subtitles immediately.
-        if (playbackStartNanos == 0L) {
-            playbackStartNanos = System.nanoTime()
-            android.util.Log.i("MouthDebug", "pushSubtitleFrame: set playbackStart fallback, queue=${subtitleFrames.size}")
-        }
+        // NOTE (09-05): do NOT start the timeline here. Frames arrive while TTS is
+        // still synthesizing (audio not playing yet); starting the base at frame
+        // arrival makes the mouth move before the sound. The base is set ONLY by
+        // markPlaybackStarted() (real audio start).
     }
 
-    /** Mark the playback start time (called from TtsPlayer's onStarted callback). */
+    /** Mark the playback start time (called from TtsPlayer's onStarted callback).
+     *  Aliyun subtitle begin_time/end_time are relative to the start of the audio
+     *  stream, so the timeline base must be the moment audio actually starts. */
     fun markPlaybackStarted() {
-        playbackStartNanos = System.nanoTime()
-        android.util.Log.i("MouthDebug", "markPlaybackStarted() called, queue=${subtitleFrames.size}")
+        playbackStartNanos = System.nanoTime() + mouthStartLeadMs * 1_000_000L
+        android.util.Log.i("MouthDebug", "markPlaybackStarted() called, queue=${subtitleFrames.size}, lead=${mouthStartLeadMs}ms")
     }
 
     /**
@@ -602,39 +894,73 @@ class AvatarEngineController(
         }
     }
 
-    /**
-     * Advance the simulation. Call every frame on the main thread.
-     */
     /** Advance the simulation. Call every frame on the main thread. */
     fun update(deltaSeconds: Float) {
-        if (deltaSeconds <= 0f) return
+            if (deltaSeconds <= 0f) return
+            // Use-after-free guard: once destroy() is called (owner ModelNode freed the
+            // Filament entities), never drive the skeleton/spring-bones again.
+            if (destroyed) return
 
         updateSequence(deltaSeconds)
         updateBodyMotion(deltaSeconds)
         updateLiveCombo(deltaSeconds)
+        updateLocomotion(deltaSeconds)
 
-                // VRMA fade transition
-        if (vrmaFadeTimer >= 0f && vrmaPrevPlayer != null) {
+                // VRMA fade transition (clip→clip cross-fade, or idle→clip fade-in)
+        if (vrmaFadeTimer >= 0f && (vrmaPrevPlayer != null || fadeInFromIdle)) {
             vrmaFadeTimer += deltaSeconds
             val t = (vrmaFadeTimer / vrmaFadeDuration).coerceIn(0f, 1f)
             // Easing curve: smoothstep
             val st = t * t * (3f - 2f * t)
             vrmaNextWeight = st
-            vrmaPrevWeight = 1f - st
-            vrmaPrevPlayer?.blendWeight = vrmaPrevWeight
-            vrmaPrevPlayer?.update(deltaSeconds)
-            vrmaPlayer?.blendWeight = vrmaNextWeight
-            vrmaPlayer?.update(deltaSeconds)
+            vrmaPrevWeight = if (fadeInFromIdle) 0f else 1f - st
+            val previous = vrmaPrevPlayer
+            val next = vrmaPlayer
+            previous?.blendWeight = vrmaPrevWeight
+            previous?.update(deltaSeconds, applyExpressions = false)
+            next?.blendWeight = vrmaNextWeight
+            next?.update(deltaSeconds, applyExpressions = false)
+            val expressionNames = previous?.expressionTrackNames.orEmpty() + next?.expressionTrackNames.orEmpty()
+            val previousValues = previous?.sampledExpressionWeights().orEmpty()
+            val nextValues = next?.sampledExpressionWeights().orEmpty()
+            ExpressionBlendMath.merge(expressionNames, previousValues, nextValues).forEach { (name, weight) ->
+                expressionManager?.setValue(name, weight)
+            }
             if (t >= 1f) {
+                vrmaPrevPlayer?.playing = false
+                vrmaPrevPlayer?.clearOwnedExpressions(vrmaPlayer?.expressionTrackNames.orEmpty())
                 vrmaFadeTimer = -1f
                 vrmaPrevPlayer = null
                 vrmaPrevWeight = 1f
                 vrmaNextWeight = 1f
                 vrmaPlayer?.blendWeight = 1f
+                if (fadeInFromIdle) {
+                    // Fade-in finished: the clip is at full weight — hand the body
+                    // over to the clip and stop the idle layer fighting it.
+                    fadeInFromIdle = false
+                    bodyMotionId = null
+                }
             }
         } else {
             vrmaPlayer?.blendWeight = 1f
             vrmaPlayer?.update(deltaSeconds)
+        }
+
+        if (vrmaPlayer?.completed == true || vrmaPlayer?.fadingOut == true) {
+            if (vrmaPlayer?.completed == true) {
+                activeVrmaSource = null
+                // Re-assert the canonical relaxed stance (arms down, slight spine
+                // lean) so the idle layer never inherits the last clip's arm pose.
+                // Without this, after clip→clip cross-fades the arms drift into a
+                // spread/A-pose that the spine-only idle layer cannot correct.
+                setPose("relaxed")
+            }
+            // One-shot clip finished (or is fading out): fall back to the natural
+            // idle (breathing + random blinks + micro-moves) instead of freezing
+            // on the last frame. Restoring idle DURING the fade makes the
+            // come-down feel alive rather than "hard stop → then idle".
+            // Looping clips never hit this branch; explicit stop uses playVrma(null).
+            if (bodyMotionId == null) setBodyMotion("idleNatural")
         }
 
         // ── Low-frequency health signal: log the driving state every 300 frames ──
@@ -654,7 +980,7 @@ class AvatarEngineController(
         // After writing bone transforms to the TransformManager, ask gltfio's
         // Animator to recompute the skin bone matrices, so the mesh follows
         // our retargeted bones. (gltfio does not poll TransformManager by itself.)
-        runCatching { instance.getAnimator()?.updateBoneMatrices() }
+        runCatching { instance.getAnimator().updateBoneMatrices() }
         expressionBindings.commitAll()
 
         if (springBoneEnabled) {
@@ -705,38 +1031,331 @@ class AvatarEngineController(
         }
     }
 
-    /** Small procedural motion layer matching xlunar's idle/breathing presets. */
-    private fun updateBodyMotion(deltaSeconds: Float) {
-        val id = bodyMotionId ?: return
-        val h = humanoid ?: return
-        bodyMotionClock += deltaSeconds
-        val amplitude = when (id) {
-            "breathingSubtle" -> 1.5f
-            "swayGentle" -> 3f
-            "idleNatural" -> 1.8f
-            else -> return
+    /** Advance whole-body locomotion: turn toward target yaw, then move toward
+     *  the active target at [moveSpeed]; write the result to [modelNode]. */
+    private fun updateLocomotion(deltaSeconds: Float) {
+        if (deltaSeconds <= 0f) return
+
+        // Turn toward the requested yaw (shortest arc), if any.
+        // CLOSED-LOOP on the MEASURED rendered forward (actualVisualYawDeg):
+        // the node's world transform carries a small theta-dependent yaw
+        // distortion (measured ~13 deg*sin(theta)) after the quaternion
+        // write, so driving the raw locYawDeg alone leaves a constant
+        // error. Feedback on the read-back value converges to the target
+        // regardless of the distortion's shape.
+        turnTargetDeg?.let { target ->
+            var diff = (target - actualVisualYawDeg) % 360f
+            if (diff > 180f) diff -= 360f
+            if (diff < -180f) diff += 360f
+            val maxTurn = turnSpeedDegPerSec * deltaSeconds
+            // Dead-zone + damped correction: the measured visual yaw has
+            // per-frame read noise, so a full correction every frame made
+            // the body wobble around the target. Correct only half the
+            // error per frame (converges smoothly) and stop entirely once
+            // within the dead-zone.
+            if (abs(diff) <= TURN_DEAD_ZONE_DEG) {
+                turnTargetDeg = null
+                Log.d(logTag, "turn done target=$target visual=$actualVisualYawDeg")
+            } else if (abs(diff) <= maxTurn) {
+                locYawDeg += diff * 0.5f
+            } else {
+                locYawDeg += if (diff > 0f) maxTurn else -maxTurn
+            }
         }
-        val phase = bodyMotionClock * if (id == "swayGentle") 1.2f else 2.0f
-        val sway = sin(phase) * amplitude
-        val bones = when (id) {
-            "swayGentle" -> mapOf(
-                "spine" to RawBoneRotation(degrees = Vec3(0f, sway, sway * 0.25f)),
-                "head" to RawBoneRotation(degrees = Vec3(0f, sway * 0.35f, 0f)),
-            )
-            else -> mapOf(
-                "spine" to RawBoneRotation(degrees = Vec3(sway, 0f, 0f)),
-            )
+
+        val t = moveTarget
+        if (t != null) {
+            val dx = t.first - locX
+            val dz = t.second - locZ
+            val dist = sqrt(dx * dx + dz * dz)
+            if (dist <= arrivalRadius) {
+                locX = t.first; locZ = t.second
+                locSpeed = 0f
+                moveTarget = null
+                turnTargetDeg = null
+                Log.d(logTag, "moveTo arrived (${locX},${locZ})")
+            } else if (turnTargetDeg != null) {
+                // Still turning to face the target: don't translate yet.
+                locSpeed = 0f
+            } else {
+                // Travel directly toward the target; visual yaw is corrected separately.
+                val toTargetYaw = Math.toDegrees(
+                    kotlin.math.atan2(dx.toDouble(), dz.toDouble())
+                ).toFloat()
+                travelYawSm += (toTargetYaw - travelYawSm) * 0.2f
+                val movement = LocomotionMath.stepToward(
+                    x = locX,
+                    z = locZ,
+                    targetX = t.first,
+                    targetZ = t.second,
+                    speed = moveSpeed,
+                    deltaSeconds = deltaSeconds,
+                )
+                lastMoveDirection = LocomotionMath.movementDirection(
+                    deltaX = movement.x - locX,
+                    deltaZ = movement.z - locZ,
+                    previous = lastMoveDirection,
+                )
+                locX = movement.x
+                locZ = movement.z
+                locSpeed = if (movement.arrived) 0f else moveSpeed
+                if (movement.arrived) {
+                    moveTarget = null
+                    turnTargetDeg = null
+                }
+                // Keep the body facing the travel direction (shortest arc),
+                // damped + dead-zoned: a full correction every frame let the
+                // per-frame read noise visibly wobble the body while walking.
+                var yawDiff = (toTargetYaw - actualVisualYawDeg) % 360f
+                if (yawDiff > 180f) yawDiff -= 360f
+                if (yawDiff < -180f) yawDiff += 360f
+                if (abs(yawDiff) > TURN_DEAD_ZONE_DEG) {
+                    locYawDeg += yawDiff * 0.5f
+                }
+                // Safety: if the avatar somehow escapes the scene bounds,
+                // abort the move instead of wandering off-screen forever.
+                if (kotlin.math.abs(locX) > 10f || kotlin.math.abs(locZ) > 10f) {
+                    Log.e(logTag, "moveTo ABORT out of bounds pos=($locX,$locZ)")
+                    moveTarget = null
+                    locSpeed = 0f
+                }
+            }
+        } else if (locSpeed > 0f && stopDeceleration > 0f) {
+            val coast = LocomotionMath.decelerationStep(locSpeed, stopDeceleration, deltaSeconds)
+            locX += lastMoveDirection.x * coast.distance
+            locZ += lastMoveDirection.z * coast.distance
+            locSpeed = coast.speed
+            if (locSpeed == 0f) stopDeceleration = 0f
+        } else {
+            locSpeed = 0f
         }
-        // Keep the layer tolerant of models without optional chest/head bones.
-        val filtered = bones.filterKeys { h.getNormalizedBoneNode(it) != null }
-        // normalized channel shares the NLR state with setPose, so body motion
-        // (spine sway) and a static pose (arms) coexist without erasing each other.
-        if (filtered.isNotEmpty()) setRawPose(filtered)
+
+        updateLocomotionClip()
+        applyNodeTransform(null)
+        if ((++diagFrames) % 30 == 0) {
+            Log.i(logTag, "DIAG locYaw=$locYawDeg actualVisual=$actualVisualYawDeg target=$visualTargetDeg pos=($locX,$locZ)")
+        }
     }
+
+    private fun updateLocomotionClip() {
+        val desired = when {
+            locSpeed <= 0.05f -> locIdleClip
+            locSpeed <= maxWalkSpeed -> locWalkClip
+            else -> locRunClip ?: locWalkClip
+        }
+        if (desired == null || desired == activeLocClip) return
+        runCatching { playVrma(desired, loop = true) }
+            .onSuccess { activeLocClip = desired }
+            .onFailure { Log.w(logTag, "locomotion clip unavailable: $desired", it) }
+    }
+
+    /** Push the current locomotion state into [modelNode]'s world transform.
+     *  Y is preserved from the node unless an explicit override is given (the
+     *  foot-bottom alignment sets the model's ground Y, so movement only touches
+     *  XZ + yaw). */
+    private fun applyNodeTransform(yOverride: Float?) {
+        val node = modelNode ?: return
+        val y = yOverride ?: node.position.y
+        node.position = io.github.sceneview.math.Position(x = locX, y = y, z = locZ)
+        // Turn the WHOLE body by an explicit axis-angle quaternion around the
+        // world +Y axis. SceneView's Rotation(y=...) euler setter maps the y
+        // component to pitch (local X axis) in this version, which silently
+        // fails to yaw the avatar (verified: worldQuaternion stayed ~identity
+        // while locYaw changed -> avatar slid sideways/backward without turning).
+        // A direct Y-axis quaternion is unambiguous and always yaws the body.
+        val yawRad = (locYawDeg * PI / 180f).toFloat()
+        // romainguy Quaternion(Float3, Float) is (xyz=imaginary, w=real), NOT
+        // axis-angle — passing Float3(0,1,0), yawRad built a malformed quat
+        // (y=1, w=yaw). Build the yaw quaternion from its components directly:
+        // pure Y rotation by θ = (0, sin(θ/2), 0, cos(θ/2)).
+        val yawQuat = dev.romainguy.kotlin.math.Quaternion(
+            0f,
+            kotlin.math.sin(yawRad * 0.5f),
+            0f,
+            kotlin.math.cos(yawRad * 0.5f),
+        )
+        node.worldQuaternion = yawQuat
+        actualVisualYawDeg = normalizeYaw(LocomotionMath.visualYaw(readVisualForwardDeg(node), facingOffsetDeg))
+    }
+
+    private fun normalizeYaw(value: Float): Float = ((value + 180f) % 360f + 360f) % 360f - 180f
+
+    /** Ground truth visual forward: rotate (0,0,1) by the node's current
+     *  world quaternion and report the XZ angle relative to +Z. */
+    private fun readVisualForwardDeg(node: ModelNode): Float {
+        return try {
+            val q = node.worldQuaternion
+            val qx = q.x; val qy = q.y; val qz = q.z; val qw = q.w
+            val ix = qw * 0f + qy * 1f - qz * 0f
+            val iy = qw * 0f + qz * 0f - qx * 1f
+            val iz = qw * 1f + qx * 0f - qy * 0f
+            val iw = -qx * 0f - qy * 0f - qz * 1f
+            val fx = ix * qw + iw * -qx + iy * -qz - iz * -qy
+            val fz = iz * qw + iw * -qz + ix * -qy - iy * -qx
+            if (fx * fx + fz * fz < 1e-6f) return locYawDeg
+            (kotlin.math.atan2(fx, fz) * 180f / kotlin.math.PI.toFloat())
+        } catch (t: Throwable) {
+            locYawDeg
+        }
+    }
+
+    /** DIAGNOSTIC: read the node's ACTUAL world orientation (rendered truth)
+     *  and log it against locYawDeg to calibrate the Rotation(y) convention.
+     *  Rotates (0,0,1) by the world quaternion and reports the XZ forward angle. */
+    private var diagFrames = 0
+    private fun diagLogForward(node: ModelNode) {
+        if ((++diagFrames) % 30 != 0) return
+        val q = node.worldQuaternion
+        val qx = q.x; val qy = q.y; val qz = q.z; val qw = q.w
+        val e = node.worldRotation
+        // rotate (0,0,1) by q: v' = q*v*q^-1
+        val ix = qw * 0f + qy * 1f - qz * 0f
+        val iy = qw * 0f + qz * 0f - qx * 1f
+        val iz = qw * 1f + qx * 0f - qy * 0f
+        val iw = -qx * 0f - qy * 0f - qz * 1f
+        val fx = ix * qw + iw * -qx + iy * -qz - iz * -qy
+        val fy = iy * qw + iw * -qy + iz * -qx - ix * -qz
+        val fz = iz * qw + iw * -qz + ix * -qy - iy * -qx
+        val yawActualDeg = kotlin.math.atan2(fx, fz) * 180f / kotlin.math.PI.toFloat()
+        val pos = node.position
+        Log.i(logTag, "DIAG locYaw=$locYawDeg visualYaw=$yawActualDeg wrY=${e.y} round=${e.y * 180f / kotlin.math.PI.toFloat()} pos=(${pos.x},${pos.z}) q=($qx,$qy,$qz,$qw)")
+    }
+
+    /** Small procedural motion layer matching xlunar's idle/breathing presets. */
+        private fun updateBodyMotion(deltaSeconds: Float) {
+            val id = bodyMotionId ?: return
+            val h = humanoid ?: return
+            bodyMotionClock += deltaSeconds
+            val amplitude = when (id) {
+                "breathingSubtle" -> 1.5f
+                "swayGentle" -> 3f
+                // RANDOM IDLE (09-03): idleNatural is no longer static — it drives a
+                // breathing sway + random blinks + occasional micro-moves, so the
+                // avatar never stands frozen and never repeats a fixed 4s loop.
+                "idleNatural" -> 1.8f
+                else -> return
+            }
+            val phase = bodyMotionClock * if (id == "swayGentle") 1.2f else 2.0f
+            val sway = sin(phase) * amplitude
+
+            // Micro-move pose (only for idleNatural, paused while listening).
+            val micro = if (id == "idleNatural") {
+                updateRandomIdle(deltaSeconds)
+                idleMicroPose()
+            } else {
+                emptyMap()
+            }
+
+            val bones = when (id) {
+                "swayGentle" -> mapOf(
+                    "spine" to RawBoneRotation(degrees = Vec3(0f, sway * 0.6f, sway * 0.25f)),
+                    "head" to RawBoneRotation(degrees = Vec3(0f, sway * 0.35f, 0f)),
+                )
+                else -> mapOf(
+                    "spine" to RawBoneRotation(degrees = Vec3(sway, 0f, 0f)),
+                )
+            }
+            // Merge the active micro-move skeleton (spine/head/neck) on top of breathing.
+            val merged = LinkedHashMap(bones)
+            micro.forEach { (bone, rot) -> merged[bone] = rot }
+
+            // Keep the layer tolerant of models without optional chest/head bones.
+            val filtered = merged.filterKeys { h.getNormalizedBoneNode(it) != null }
+            // normalized channel shares the NLR state with setPose, so body motion
+            // (spine sway) and a static pose (arms) coexist without erasing each other.
+            if (filtered.isNotEmpty()) setRawPose(filtered)
+        }
+
+        /** Advance the random blink + micro-move state machines for idleNatural. */
+        private fun updateRandomIdle(deltaSeconds: Float) {
+            // Speaking (lip-sync broadcast, 09-05): no NEW blinks, no NEW
+            // micro-moves — an in-flight action finishes its ease-out envelope
+            // so the head doesn't snap back. Only breathing + lip-sync remain.
+            if (speakingActive) {
+                if (idleBlinkPhase >= 0f) {
+                    idleBlinkPhase += deltaSeconds * (if (idleBlinkPhase < 0.2f) 7f else 5f)
+                    expressionManager?.setValue("blink", if (idleBlinkPhase < 0.35f) 1f else 0f)
+                    if (idleBlinkPhase >= 1f) {
+                        expressionManager?.setValue("blink", 0f)
+                        idleBlinkPhase = -1f
+                    }
+                }
+                if (idleActionType >= 0) {
+                    idleActionProgress += deltaSeconds / 2.2f
+                    if (idleActionProgress >= 1f) idleActionType = -1
+                }
+                return
+            }
+            // Blink envelope: quick close (to weight 1), brief hold, quick open.
+            if (idleBlinkPhase >= 0f) {
+                idleBlinkPhase += deltaSeconds * (if (idleBlinkPhase < 0.2f) 7f else 5f)
+                expressionManager?.setValue("blink", if (idleBlinkPhase < 0.35f) 1f else 0f)
+                if (idleBlinkPhase >= 1f) {
+                    expressionManager?.setValue("blink", 0f)
+                    idleBlinkPhase = -1f
+                    // Frequent + random blinks (1.2~4s), with ~20% chance of a
+                    // natural double-blink (next one fires 0.22s later).
+                    idleBlinkTimer = if (idleRand.nextFloat() < 0.2f) 0.22f
+                        else 1.2f + idleRand.nextFloat() * 2.8f
+                }
+            } else {
+                idleBlinkTimer -= deltaSeconds
+                if (idleBlinkTimer <= 0f) idleBlinkPhase = 0f
+            }
+
+            // Micro-move envelope (paused while listening: no big head/arm gestures).
+            if (listeningActive) {
+                idleActionType = -1
+                return
+            }
+            if (idleActionType >= 0) {
+                idleActionProgress += deltaSeconds / 2.2f
+                if (idleActionProgress >= 1f) idleActionType = -1
+            } else {
+                idleActionTimer -= deltaSeconds
+                if (idleActionTimer <= 0f) {
+                    idleActionType = idleRand.nextInt(5) // 0..4
+                    idleActionProgress = 0f
+                    idleActionTimer = 6f + idleRand.nextFloat() * 9f
+                }
+            }
+        }
+
+        /** Build the current micro-move pose for [idleActionType] with an ease envelope. */
+        private fun idleMicroPose(): Map<String, RawBoneRotation> {
+            val type = idleActionType
+            if (type < 0) return emptyMap()
+            val a = idleActionProgress.coerceIn(0f, 1f)
+            val env = when {
+                a < 0.2f -> a / 0.2f
+                a > 0.8f -> (1f - a) / 0.2f
+                else -> 1f
+            }
+            return when (type) {
+                0, 1 -> {
+                    val dir = if (type == 0) -1f else 1f
+                    mapOf(
+                        "head" to RawBoneRotation(degrees = Vec3(0f, 14f * dir * env, 0f)),
+                        "spine" to RawBoneRotation(degrees = Vec3(0f, 8f * dir * env, 0f)),
+                    )
+                }
+                2 -> mapOf("neck" to RawBoneRotation(degrees = Vec3(4f * env, 0f, 0f)))
+                3 -> mapOf("head" to RawBoneRotation(degrees = Vec3(6f * env, 0f, 8f * env)))
+                // rebound / weight-shift: a gentle hips+spine forward-then-back sway
+                else -> mapOf(
+                    "hips" to RawBoneRotation(degrees = Vec3(-6f * env, 0f, 0f)),
+                    "spine" to RawBoneRotation(degrees = Vec3(4f * env, 0f, 0f)),
+                )
+            }
+        }
 
     /** Release Filament resources owned outside the asset (if any). */
     fun destroy() {
-        // ModelNode owns the asset/instance lifecycle; nothing extra to free here.
+        // Guard against use-after-free: the owning ModelNode frees the Filament
+        // entities (incl. spring-bone TransformManager entities) on destroy; a
+        // lingering SceneView onFrame must not keep driving a controller whose
+        // entities are already released (SIGSEGV in TransformManager.setTransform).
+        destroyed = true
     }
 
     /** The vrm-core parsed VRM (for tests / inspection). */

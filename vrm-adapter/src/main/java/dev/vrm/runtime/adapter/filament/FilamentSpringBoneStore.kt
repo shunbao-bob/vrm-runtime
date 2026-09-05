@@ -100,12 +100,14 @@ class FilamentSpringBoneStore(
         if (entity == 0) return
         val i = transformManager.getInstance(entity)
         if (i == 0) return
-        // Read the current local matrix, replace the rotation part, write back
-        transformManager.getTransform(entity, tmpMat)
+        // Read the current local matrix, replace the rotation part, write back.
+        // NOTE: TransformManager takes an INSTANCE (i), not the raw entity.
+        // Passing entity here corrupts the handle -> garbage pose -> "beast ears".
+        transformManager.getTransform(i, tmpMat)
         val old = Mat4(tmpMat.copyOf())
         val p = Vec3(); val oldQ = Quat(); val s = Vec3()
         old.decompose(p, oldQ, s)
-        transformManager.setTransform(entity, Mat4.fromPositionRotationScale(p, q, s).elements)
+        transformManager.setTransform(i, Mat4.fromPositionRotationScale(p, q, s).elements)
         // Mirror into the shared world-math store so later joints / the next
         // frame see this bone's new rotation (live world matrices).
         mathStore.setLocalRotation(nodeIndex, q)

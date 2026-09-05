@@ -1,5 +1,7 @@
 package dev.vrm.runtime.core.controller
 
+import dev.vrm.runtime.core.motion.MotionSpec
+
 /**
  * Engine-specific hooks that [AvatarController] uses to actually drive the
  * avatar. The core is engine-agnostic; a host (Filament demo, headless test)
@@ -34,6 +36,32 @@ interface AvatarBinding {
 
     /** Set raw expression weights (name -> 0..1). */
     fun setRawExpression(values: Map<String, Float>)
+
+    // ── Locomotion (whole-body movement) hooks ──
+    // Optional by default so lightweight bindings / test stubs don't have to
+    // implement them; the Filament engine overrides these to drive the model
+    // node's world transform. vrm-character issues these via AvatarCommand.
+
+    /** Move toward an absolute world target at [speed]; stop within [arrivalRadius]. */
+    fun moveTo(x: Float, z: Float, y: Float, speed: Float, arrivalRadius: Float) = Unit
+
+    /** Turn the facing to an absolute yaw (degrees) at [turnSpeedDegPerSec]. */
+    fun turnTo(yawDegrees: Float, turnSpeedDegPerSec: Float) = Unit
+
+    /** Immediately place the model node at a world transform (teleport). */
+    fun setWorldTransform(x: Float, y: Float, z: Float, yawDegrees: Float) = Unit
+
+    /** Brake to zero speed over [deceleration] seconds. */
+    fun stopMove(deceleration: Float) = Unit
+
+    /** Configure the locomotion state machine clip mapping. */
+    fun setLocomotion(
+        idle: String?, walk: String?, run: String?,
+        maxWalkSpeed: Float, maxRunSpeed: Float,
+    ) = Unit
+
+    /** Play an LLM-generated keyframe animation ([MotionSpec]). */
+    fun playMotionSpec(spec: MotionSpec, loop: Boolean = false) = Unit
 
     /** Reset everything to neutral. */
     fun reset()

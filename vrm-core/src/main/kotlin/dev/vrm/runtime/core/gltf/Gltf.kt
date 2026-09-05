@@ -137,6 +137,8 @@ data class PbrMetallicRoughness(
 data class TextureInfo(
     val index: Int? = null,
     val texCoord: Int = 0,
+    /** glTF normalTexture scale. Ignored for non-normal texture infos. */
+    val scale: Float? = null,
     val extensions: Map<String, JsonElement>? = null,
     val extras: JsonElement? = null,
 )

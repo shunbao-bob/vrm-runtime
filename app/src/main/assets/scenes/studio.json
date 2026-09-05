@@ -1,0 +1,15 @@
+{
+  "name": "studio",
+  "groundY": 0.0,
+  "characterRadius": 0.3,
+  "bounds": { "minX": -4.0, "maxX": 4.0, "minZ": -4.0, "maxZ": 4.0 },
+  "obstacles": [
+    { "id": "desk_right",   "type": "box", "center": { "x": 3.0, "y": 0.0, "z": -2.0 }, "halfExtents": { "x": 0.6, "y": 0.5, "z": 0.4 } },
+    { "id": "shelf_left",   "type": "box", "center": { "x": -3.0, "y": 0.0, "z": 2.0 }, "halfExtents": { "x": 0.4, "y": 1.0, "z": 0.6 } }
+  ],
+  "anchors": [
+    { "id": "center", "x": 0.0, "y": 0.0, "z": 0.0, "arrivalRadius": 0.2 },
+    { "id": "back_right", "x": 3.0, "y": 0.0, "z": 3.0 },
+    { "id": "front_left", "x": -3.0, "y": 0.0, "z": -3.0 }
+  ]
+}

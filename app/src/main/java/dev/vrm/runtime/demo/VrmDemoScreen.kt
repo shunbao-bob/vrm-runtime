@@ -41,8 +41,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import dev.vrm.runtime.adapter.AvatarRenderer
 import dev.vrm.runtime.adapter.StageConfig
+import dev.vrm.runtime.character.CharacterController
+import dev.vrm.runtime.character.SceneConfig
 import dev.vrm.runtime.core.controller.AvatarCommand
 import dev.vrm.runtime.core.controller.AvatarController
 import dev.vrm.runtime.core.controller.AnimationPreset
@@ -54,11 +57,14 @@ import dev.vrm.runtime.core.controller.SequencePreset
 import io.github.sceneview.Scene
 import io.github.sceneview.rememberCameraManipulator
 import io.github.sceneview.rememberCameraNode
+import io.github.sceneview.rememberCollisionSystem
 import io.github.sceneview.rememberEngine
 import io.github.sceneview.rememberEnvironmentLoader
 import io.github.sceneview.rememberModelLoader
 import io.github.sceneview.rememberNode
 import io.github.sceneview.rememberOnGestureListener
+import io.github.sceneview.rememberScene
+import io.github.sceneview.rememberView
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
@@ -112,6 +118,15 @@ fun VrmDemoScreen() {
     val modelLoader = rememberModelLoader(engine, context)
     val environmentLoader = rememberEnvironmentLoader(engine)
 
+    // 4.33: SceneView 不再接收 childNodes —— 外部节点（AvatarRenderer 自建 modelNode/lightNode）
+    // 需自建 Filament Scene + SceneNodeManager 手动挂载后，把同一个 scene 传给 SceneView。
+    val scene = rememberScene(engine)
+    val view = rememberView(engine)
+    val collisionSystem = rememberCollisionSystem(view)
+    val sceneManager = remember(scene, collisionSystem) {
+        io.github.sceneview.SceneNodeManager(scene, collisionSystem)
+    }
+
     // tab + selection state
     var activeTab by remember { mutableIntStateOf(TAB_MODEL) }
     var selectedModelIdx by remember { mutableIntStateOf(0) }
@@ -123,7 +138,7 @@ fun VrmDemoScreen() {
     var dirIntensity by remember { mutableStateOf(1.1f) }
     var cameraDistance by remember { mutableStateOf(1.0f) }
     var lookAtAuto by remember { mutableStateOf(false) }
-    var currentEnvId by remember { mutableStateOf("studio") }
+    var currentEnvId by remember { mutableStateOf("ferndale_studio_10") }
     var speaking by remember { mutableStateOf(false) }
     var faceWeights by remember {
         mutableStateOf(DemoAssets.expressions.associate { it.id to 0f })
@@ -132,21 +147,30 @@ fun VrmDemoScreen() {
 
     // the adapter renderer (created once)
     val rendererRef = remember { AtomicReference<AvatarRenderer?>(null) }
+    // the engine-agnostic character controller (vrm-character), created once
+    val characterRef = remember { AtomicReference<CharacterController?>(null) }
 
     // the model node surfaced as Compose state so Scene recomposes on model switch
     val modelNodeState = remember { mutableStateOf<io.github.sceneview.node.ModelNode?>(null) }
     // the directional light node surfaced as Compose state so Scene includes it
     val lightNodeState = remember { mutableStateOf<io.github.sceneview.node.LightNode?>(null) }
 
+    // 4.33: 模型/灯光节点(renderer自建)挂进自建 Filament Scene；addNode 幂等，state 更新安全。
+    LaunchedEffect(modelNodeState.value, lightNodeState.value) {
+        modelNodeState.value?.let { sceneManager.addNode(it) }
+        lightNodeState.value?.let { sceneManager.addNode(it) }
+    }
+
     val assetResolver = { key: String ->
         runCatching { context.assets.open(key).use { it.readBytes() } }.getOrNull()
     }
 
-    // environment map (initially uses the studio ktx)
+    // environment map (initially uses the ferndale_studio_10 ktx — same default
+    // background as demoPhone; can be switched in the Scene tab)
     var environment by remember {
         mutableStateOf<io.github.sceneview.environment.Environment?>(environmentLoader.createKTX1Environment(
-            iblAssetFile = "environments/studio/studio_ibl.ktx",
-            skyboxAssetFile = "environments/studio/studio_skybox.ktx",
+            iblAssetFile = "environments/ferndale_studio_10/ferndale_studio_10_ibl.ktx",
+            skyboxAssetFile = "environments/ferndale_studio_10/ferndale_studio_10_skybox.ktx",
         ))
     }
 
@@ -157,11 +181,25 @@ fun VrmDemoScreen() {
         lookAt(centerNode)
         centerNode.addChildNode(this)
     }
-    // update camera position when the camera distance changes
-    LaunchedEffect(cameraDistance) {
-        cameraNode.position = io.github.sceneview.math.Position(y = 1.0f, z = cameraDistance)
-        cameraNode.lookAt(centerNode)
+    // 4.33: 组合期节点通过 DisposableEffect 挂进自建 scene
+    DisposableEffect(sceneManager, centerNode) {
+        sceneManager.addNode(centerNode)
+        onDispose { sceneManager.removeNode(centerNode) }
     }
+    // Update camera position when the camera distance changes. Baseline framing
+    // matches demoPhone (text-to-vrma viewer.js): distance = height * 2.1,
+    // height = height * 0.65, target = height * 0.55 — so the same model shows
+    // at the same size as in demoPhone; the slider scales the distance.
+    fun updateCamera() {
+        val he = modelNodeState.value?.halfExtent
+        val height = maxOf(0.5f, (he?.y ?: 1f) * 2f)
+        cameraNode.position = io.github.sceneview.math.Position(
+            y = height * 0.65f,
+            z = height * 2.1f * cameraDistance,
+        )
+        cameraNode.lookAt(io.github.sceneview.math.Position(0f, height * 0.55f, 0f))
+    }
+    LaunchedEffect(cameraDistance, modelNodeState.value) { updateCamera() }
     // reload the ktx when the environment changes
     LaunchedEffect(currentEnvId) {
         runCatching {
@@ -179,13 +217,30 @@ fun VrmDemoScreen() {
     LaunchedEffect(engine, modelLoader) {
         val renderer = AvatarRenderer(engine, modelLoader, context, assetResolver, DemoAssets.config)
         rendererRef.set(renderer)
-        // load the default model and bake the default animation
-        val defaultAnim = DemoAssets.animations.firstOrNull { it.id == "greeting" }
-            ?: DemoAssets.animations.firstOrNull { it.id == "spin" }
-            ?: DemoAssets.animations.first { it.loop }
-        vrmaLoop = defaultAnim.loop
+        // Build the engine-agnostic character controller (vrm-character) wired to
+        // this renderer: commands → AvatarController, state reads → engine getters.
+        runCatching {
+            val sceneJson = context.assets.open("scenes/studio.json").use { it.readBytes() }
+            val scene = SceneConfig.parse(sceneJson)
+            val character = CharacterController(
+                output = DemoCharacterOutput(
+                    controllerRef = { rendererRef.get()?.avatar },
+                    engineRef = { rendererRef.get()?.engineController },
+                ),
+                scene = scene,
+            )
+            characterRef.set(character)
+            android.util.Log.i("AvatarEngine", "CharacterController created scene=${scene.name} obstacles=${scene.obstacles.size} anchors=${scene.anchors.size}")
+        }.onFailure {
+            android.util.Log.w("AvatarEngine", "CharacterController init failed: ${it.message}")
+        }
+        // load the default model WITHOUT auto-playing a VRMA loop — matching
+        // demoPhone: start on the relaxed stance + idleNatural random idle
+        // (breathing + blinks + micro-moves), not a looped choreography.
         renderer.loadModel(DemoAssets.models.firstOrNull { it.id == "vroid-b" }?.source
-            ?: DemoAssets.models.first().source, animationSource = defaultAnim.source)
+            ?: DemoAssets.models.first().source)
+        renderer.engineController?.setPose("relaxed")
+        renderer.engineController?.setBodyMotion("idleNatural")
         modelNodeState.value = renderer.modelNode
         lightNodeState.value = renderer.createOrUpdateLight()
     }
@@ -252,9 +307,74 @@ fun VrmDemoScreen() {
                     android.util.Log.i("AvatarEngine", "EVENT expr live id=$exprId weight=$weight")
                     return
                 }
+                // ── vrm-character (task 13): drive via adb broadcast ──
+                //   adb shell am broadcast -a dev.vrm.runtime.demo.SWITCH -e movex 2 -e movez 1 [-e speed 1.5]
+                //   adb shell am broadcast -a dev.vrm.runtime.demo.SWITCH -e wander 1|0
+                //   adb shell am broadcast -a dev.vrm.runtime.demo.SWITCH -e emote happy
+                //   adb shell am broadcast -a dev.vrm.runtime.demo.SWITCH -e move_anchor door
+                //   adb shell am broadcast -a dev.vrm.runtime.demo.SWITCH -e intent '{"actions":[...]}'
+                val cc = characterRef.get()
+                if (cc != null) {
+                    val moveX = intent.getStringExtra("movex")?.toFloatOrNull()
+                    val moveZ = intent.getStringExtra("movez")?.toFloatOrNull()
+                    if (moveX != null && moveZ != null) {
+                        val speed = intent.getStringExtra("speed")?.toFloatOrNull() ?: cc.motion.walkSpeed
+                        cc.moveTo(moveX, moveZ, speed)
+                        android.util.Log.i("AvatarChar", "EVENT moveTo ($moveX,$moveZ) speed=$speed")
+                        return
+                    }
+                    val wander = intent.getStringExtra("wander")
+                    if (wander != null) {
+                        // Accept "1"/"0" as well as "true"/"false" (String.toBoolean only reads "true").
+                        cc.wanderEnabled = wander == "1" || wander.equals("true", ignoreCase = true)
+                        android.util.Log.i("AvatarChar", "EVENT wander=${cc.wanderEnabled}")
+                        return
+                    }
+                    val emote = intent.getStringExtra("emote")
+                    if (emote != null) {
+                        val em = intent.getFloatExtra("eintensity", 1f)
+                        cc.emote(emote, em.coerceIn(0f, 1f))
+                        android.util.Log.i("AvatarChar", "EVENT emote=$emote intensity=$em")
+                        return
+                    }
+                    val motionId = intent.getStringExtra("motion")
+                    if (motionId != null) {
+                        val spec = DemoMotions.all[motionId]
+                        if (spec != null) {
+                            cc.playMotion(spec)
+                            android.util.Log.i("AvatarChar", "EVENT motion=$motionId dur=${spec.duration}")
+                        } else {
+                            android.util.Log.w("AvatarChar", "EVENT motion unknown id=$motionId")
+                        }
+                        return
+                    }
+                    val motionJson = intent.getStringExtra("motion_json")
+                    if (motionJson != null) {
+                        val ok = cc.playMotionJson(motionJson)
+                        android.util.Log.i("AvatarChar", "EVENT motion_json ok=$ok")
+                        return
+                    }
+                    val anchor = intent.getStringExtra("move_anchor")
+                    if (anchor != null) {
+                        cc.moveToAnchor(anchor)
+                        android.util.Log.i("AvatarChar", "EVENT moveToAnchor=$anchor")
+                        return
+                    }
+                    val intentJson = intent.getStringExtra("intent")
+                    if (intentJson != null) {
+                        val n = cc.drive(intentJson)
+                        android.util.Log.i("AvatarChar", "EVENT intent actions=$n")
+                        return
+                    }
+                }
             }
         }
-        context.registerReceiver(receiver, filter)
+        ContextCompat.registerReceiver(
+            context,
+            receiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
         onDispose { context.unregisterReceiver(receiver) }
     }
 
@@ -268,11 +388,6 @@ fun VrmDemoScreen() {
                 )
             )
         }
-    }
-
-    LaunchedEffect(cameraDistance) {
-        cameraNode.position = io.github.sceneview.math.Position(y = 1.0f, z = cameraDistance)
-        cameraNode.lookAt(centerNode)
     }
 
     val lookAtTime = remember { AtomicLong(0L) }
@@ -293,12 +408,13 @@ fun VrmDemoScreen() {
                 modifier = Modifier.fillMaxSize(),
                 engine = engine,
                 modelLoader = modelLoader,
+                scene = scene,
+                view = view,
                 cameraNode = cameraNode,
                 cameraManipulator = rememberCameraManipulator(
                     orbitHomePosition = cameraNode.worldPosition,
                     targetPosition = centerNode.worldPosition,
                 ),
-                childNodes = listOfNotNull(centerNode, modelNodeState.value, lightNodeState.value),
                 environment = environment!!,
                 onFrame = {
                     val renderer = rendererRef.get()
@@ -308,6 +424,9 @@ fun VrmDemoScreen() {
                             renderer.engineController?.updateMouth(1f / 60f)
                         }
                         renderer.update(1f / 60f)
+                        // Advance the vrm-character layer (motion / emotion /
+                        // expression / lipsync / wander), driving the engine.
+                        characterRef.get()?.update(1f / 60f)
                         // LIVE DRIVING (08-24): renderer.update() already
                         // advances the real-time VRMA player -> humanoid.update()
                         // -> store.setLocalRotation (TransformManager) and calls
@@ -694,7 +813,7 @@ private fun SceneTab(
     Slider(value = cameraDistance, onValueChange = onCameraDistance, valueRange = 0.5f..2.5f)
     Text("Environment", fontSize = 13.sp)
     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        listOf("studio", "flower_road", "venice").forEach { id ->
+        listOf("studio", "ferndale_studio_10", "brown_photostudio_02").forEach { id ->
             Text(
                 text = id.replaceFirstChar { it.uppercaseChar() },
                 fontSize = 12.sp,

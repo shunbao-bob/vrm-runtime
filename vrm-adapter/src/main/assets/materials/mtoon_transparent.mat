@@ -4,43 +4,34 @@ material {
     doubleSided : true,
     blending : transparent,
     parameters : [
-        {
-            name : baseColorFactor,
-            type : float4,
-            default : [1, 1, 1, 1]
-        },
-        {
-            name : shadeColorFactor,
-            type : float3,
-            default : [0, 0, 0]
-        },
-        {
-            name : shadingShift,
-            type : float,
-            default : 0.0
-        },
-        {
-            name : shadingToony,
-            type : float,
-            default : 0.95
-        },
-        {
-            name : lightDir,
-            type : float3,
-            default : [0, -0.2, 1]
-        },
-        {
-            name : baseColorMap,
-            type : sampler2d
-        },
-        {
-            name : shadeMap,
-            type : sampler2d
-        }
+        { name : baseColorFactor, type : float4, default : [1, 1, 1, 1] },
+        { name : shadeColorFactor, type : float3, default : [0, 0, 0] },
+        { name : shadingShift, type : float, default : 0.0 },
+        { name : shadingToony, type : float, default : 0.9 },
+        { name : shadingShiftTextureScale, type : float, default : 1.0 },
+        { name : normalScale, type : float, default : 1.0 },
+        { name : giEqualization, type : float, default : 0.9 },
+        { name : matcapFactor, type : float3, default : [1, 1, 1] },
+        { name : parametricRimColorFactor, type : float3, default : [0, 0, 0] },
+        { name : rimLightingMix, type : float, default : 1.0 },
+        { name : rimFresnelPower, type : float, default : 5.0 },
+        { name : rimLift, type : float, default : 0.0 },
+        { name : emissiveFactor, type : float3, default : [0, 0, 0] },
+        { name : uvAnimationOffset, type : float2, default : [0, 0] },
+        { name : uvAnimationRotation, type : float, default : 0.0 },
+        { name : lightDir, type : float3, default : [0, -0.2, 1] },
+        { name : lightColor, type : float3, default : [2.827, 2.827, 2.827] },
+        { name : ambientColor, type : float3, default : [0.825, 0.913, 1.1] },
+        { name : baseColorMap, type : sampler2d },
+        { name : shadeColorMap, type : sampler2d },
+        { name : normalMap, type : sampler2d },
+        { name : shadingShiftMap, type : sampler2d },
+        { name : matcapTexture, type : sampler2d },
+        { name : rimMultiplyTexture, type : sampler2d },
+        { name : emissiveMap, type : sampler2d },
+        { name : uvAnimationMaskTexture, type : sampler2d }
     ],
-    requires : [
-        uv0
-    ]
+    requires : [ uv0, tangents ]
 }
 
 fragment {
@@ -48,30 +39,47 @@ fragment {
         prepareMaterial(material);
 
         vec2 uv = getUV0();
-        vec4 base = texture(materialParams_baseColorMap, uv) * materialParams.baseColorFactor;
-        float alpha = base.a;
+        float uvAnimMask = texture(materialParams_uvAnimationMaskTexture, uv).b;
+        float uvRotCos = cos(materialParams.uvAnimationRotation * uvAnimMask);
+        float uvRotSin = sin(materialParams.uvAnimationRotation * uvAnimMask);
+        uv = mat2(uvRotCos, -uvRotSin, uvRotSin, uvRotCos) * (uv - 0.5) + 0.5;
+        uv += materialParams.uvAnimationOffset * uvAnimMask;
+        vec4 diffuseColor = texture(materialParams_baseColorMap, uv) * materialParams.baseColorFactor;
+        vec3 shadeColor = texture(materialParams_shadeColorMap, uv).rgb * materialParams.shadeColorFactor;
 
-        // 法线：必须用 getWorldTangentFrame()[2]（第三列=法线，第一列是切线）！
-        // unlit 材质没有 getWorldNormal()，只能用切线帧取第三列。
-        vec3 N = normalize(getWorldTangentFrame()[2]);
+        vec3 mapN = texture(materialParams_normalMap, uv).xyz * 2.0 - 1.0;
+        mapN.xy *= materialParams.normalScale;
+        vec3 N = normalize(getWorldTangentFrame() * mapN);
         vec3 L = normalize(materialParams.lightDir);
+        vec3 V = normalize(getWorldViewVector());
+        float dotNL = clamp(dot(N, L), -1.0, 1.0);
 
-        // MToon cel 明暗：shadeRatio 0=暗 1=亮
-        float NdotL = dot(N, L);
-        float shadeRatio = clamp(NdotL * 0.5 + 0.5 + materialParams.shadingShift, 0.0, 1.0);
-        float toony = clamp(materialParams.shadingToony, 0.0, 1.0);
-        float lit = pow(shadeRatio, 1.0 - toony * 0.95);
-        float boundary = smoothstep(0.4, 0.6, shadeRatio);
-        lit = mix(lit, boundary, toony);
+        float shift = materialParams.shadingShift
+            + texture(materialParams_shadingShiftMap, uv).r * materialParams.shadingShiftTextureScale;
+        float feather = 1.0 - materialParams.shadingToony;
+        float shading;
+        if (feather <= 0.0) {
+            shading = step(0.0, dotNL + shift);
+        } else {
+            shading = clamp((dotNL + shift + feather) / (2.0 * feather), 0.0, 1.0);
+        }
 
-        // shade 色：factor * shadeMap（clamp 避免透明区 RGB 黑把色压死）
-        vec3 shadeColor = materialParams.shadeColorFactor;
-        vec4 shadeMapColor = texture(materialParams_shadeMap, uv);
-        shadeColor = shadeColor * clamp(shadeMapColor.rgb, 0.0, 1.0);
+        vec3 feathered = mix(shadeColor, diffuseColor.rgb, shading);
+        vec3 directDiffuse = feathered * materialParams.lightColor * (1.0 / 3.14159265);
+        vec3 indirectDiffuse = materialParams.ambientColor * diffuseColor.rgb * (1.0 / 3.14159265);
+        vec3 color = directDiffuse + indirectDiffuse;
 
-        // 明暗插值：亮部 base，暗部 shade
-        vec3 color = mix(shadeColor, base.rgb, lit);
+        vec3 rimLight = materialParams.parametricRimColorFactor
+            * pow(clamp(1.0 - dot(V, N) + materialParams.rimLift, 0.0, 1.0), materialParams.rimFresnelPower);
+        vec3 matcapX = normalize(cross(vec3(0.0, 1.0, 0.0), V));
+        vec3 matcapY = cross(V, matcapX);
+        vec2 sphereUv = 0.5 + 0.5 * vec2(dot(matcapX, N), -dot(matcapY, N));
+        rimLight += materialParams.matcapFactor * texture(materialParams_matcapTexture, sphereUv).rgb;
+        rimLight *= texture(materialParams_rimMultiplyTexture, uv).rgb;
+        vec3 rimIrradiance = (materialParams.lightColor + materialParams.ambientColor) * (1.0 / 3.14159265);
+        color += mix(vec3(1.0), rimIrradiance, materialParams.rimLightingMix) * rimLight;
 
-        material.baseColor = vec4(color, alpha);
+        color += materialParams.emissiveFactor * texture(materialParams_emissiveMap, uv).rgb;
+        material.baseColor = vec4(color, diffuseColor.a);
     }
 }

@@ -9,5 +9,12 @@ app/build/
 build/
 hs_err_*.log
 replay_pid*.log
+# adb 调试截图（不提交）
+screen_*.png
 vrm-adapter/build/
 vrm-core/build/
+
+# macOS / tooling junk
+.DS_Store
+.workbuddy/
+local.properties

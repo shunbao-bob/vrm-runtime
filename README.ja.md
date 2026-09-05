@@ -171,6 +171,8 @@ avatar.onVrmaComplete()          // プレイヤー終了後にホストから�
 
 ## デモアプリ
 
+> 🎬 **デモ動画**: [`demo/demophone_effect_10s.mp4`](demo/demophone_effect_10s.mp4)
+
 `app` モジュールは完全に実行可能な Compose デモです：
 
 - **モデルセレクター**：`public/1.0` で同期した 42 個の VRM 1.0 モデルを切替（`avatars/` の 8 サンプル + `models/` の 34 キャラクター）

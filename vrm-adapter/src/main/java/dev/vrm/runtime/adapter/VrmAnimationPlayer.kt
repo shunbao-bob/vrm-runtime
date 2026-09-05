@@ -39,9 +39,37 @@ class VrmAnimationPlayer(
 
     /** Playback speed multiplier. */
     var speed: Float = 1f
+
+    /** True only when playback reached its natural end or finished fading out. */
+    var completed: Boolean = false
+        private set
+
+    /** True while a fade-out to idle is in progress (clip still sampling but
+     *  influence ramping to 0). Lets the controller restore idle breathing
+     *  during the transition instead of waiting for [completed]. */
+    var fadingOut: Boolean = false
+        private set
     
     /** Blend weight 0~1 for cross-fade. 1 = full clip, 0 = no influence. */
     var blendWeight: Float = 1f
+
+    /** Duration of the fade-out-to-idle transition after a one-shot clip ends. */
+    var idleFadeDuration: Float = 0.45f
+
+    /** Fade-out: while > 0 the clip keeps sampling but its influence
+     *  ramps to 0 over fadeOutRemaining seconds, then the pose fully
+     *  resets. Prevents the "frozen half-step pose + springbone recoil
+     *  wobble" when locomotion stops abruptly. */
+    var fadeOutRemaining: Float = 0f
+    private var fadeOutDuration: Float = 0.3f
+
+    /** Pose snapshot taken on the FIRST update (i.e. whatever the rig held
+     *  right before this clip started — the natural idle stance). Fade-outs
+     *  relax toward THIS pose, never toward the normalized rest (T-pose):
+     *  resetting to T-pose left the arms straight out because the idle
+     *  layer only drives the spine. */
+    private var restPose: Map<String, Quat>? = null
+    private var restHipsPos: Vec3? = null
 
     val duration: Float get() = clip.duration
 
@@ -57,22 +85,96 @@ class VrmAnimationPlayer(
         clip.tracks.filter { it.name.endsWith(".weight") }
             .associateBy { it.name.removeSuffix(".weight") }
     }
+    internal val expressionTrackNames: Set<String> get() = weightTracks.keys
+
+    internal fun clearOwnedExpressions(keep: Set<String> = emptySet()) {
+        weightTracks.keys.filterNot { it in keep }
+            .forEach { expressionManager?.setValue(it, 0f) }
+    }
     private val lookAtTrack: KeyframeTrack? by lazy {
         clip.tracks.firstOrNull { it.name == "lookAt.quaternion" }
     }
 
+    /** Begin a smooth fade-out (call instead of hard-stopping). */
+    fun startFadeOut(seconds: Float = 0.3f) {
+        if (!playing) return
+        completed = false
+        fadingOut = true
+        fadeOutDuration = seconds
+        fadeOutRemaining = seconds
+    }
+
     /** Advance the clip and apply its current state. Main thread. */
-    fun update(deltaSeconds: Float) {
+    fun update(deltaSeconds: Float, applyExpressions: Boolean = true) {
         if (!playing || duration <= 0f) return
-        time += deltaSeconds * speed
-        if (loop) {
-            time = time % duration
-        } else if (time >= duration) {
-            time = duration - 0.0001f
-            playing = false
+        if (fadeOutRemaining > 0f) {
+            fadeOutRemaining -= deltaSeconds
+            fadingOut = true
+            val linear = (fadeOutRemaining / fadeOutDuration).coerceIn(0f, 1f)
+            // Ease-in-out so the tail doesn't slam to zero: keep most of the
+            // motion early, glide out gently at the end (natural come-down).
+            blendWeight = linear * linear * (3f - 2f * linear)
+            if (fadeOutRemaining <= 0f) {
+                playing = false
+                completed = true
+                fadingOut = false
+                if (applyExpressions) clearOwnedExpressions()
+                // Settle on the pre-walk idle stance snapshot.
+                // the normalized rest here: that is a T-pose, and the idle
+                // layer only drives the spine — the arms stayed straight out.
+                val settle = HashMap<String, PoseTransform>()
+                restPose.orEmpty().forEach { (boneName, q) ->
+                    if (humanoid.getNormalizedBoneNode(boneName) != null) {
+                        val p = PoseTransform()
+                        p.rotation = Quat(q.x, q.y, q.z, q.w)
+                        settle[boneName] = p
+                    }
+                }
+                restHipsPos?.let { rh ->
+                    val p = settle.getOrPut(HumanBoneName.HIPS) { PoseTransform() }
+                    p.position = Vec3(rh.x, rh.y, rh.z)
+                }
+                humanoid.setNormalizedPose(settle)
+                humanoid.update()
+                return
+            }
+        }
+        var finishedThisFrame = false
+        if (fadeOutRemaining > 0f) {
+            // Already fading out (explicit stop): freeze at the final frame — the
+            // fade-out block above is relaxing toward the rest (idle) pose.
+        } else {
+            time += deltaSeconds * speed
+            if (loop) {
+                time = time % duration
+            } else if (time >= duration) {
+                time = duration
+                // Natural end of a one-shot clip: fade out smoothly to the rest
+                // pose (the idle stance captured at clip start) instead of
+                // freezing on the last frame — which could leave e.g. the arms
+                // clipping into the body.
+                fadeOutDuration = idleFadeDuration
+                fadeOutRemaining = idleFadeDuration
+            }
         }
 
         val t = time
+
+        // One-time snapshot of the rig as it was BEFORE this clip's first
+        // write (the pre-walk idle stance) — the fade-out target.
+        if (restPose == null) {
+            val cap = HashMap<String, Quat>()
+            for (boneName in rotationTracks.keys) {
+                val node = humanoid.getNormalizedBoneNode(boneName) ?: continue
+                val q = node.quaternion
+                cap[boneName] = Quat(q.x, q.y, q.z, q.w)
+            }
+            restPose = cap
+            humanoid.getNormalizedBoneNode(HumanBoneName.HIPS)?.let { n ->
+                val p = n.position
+                restHipsPos = Vec3(p.x, p.y, p.z)
+            }
+        }
 
         val pose = HashMap<String, PoseTransform>()
         for (boneName in rotationTracks.keys) {
@@ -86,16 +188,49 @@ class VrmAnimationPlayer(
             }
         }
 
+        // Hips position: keep ONLY the vertical (Y) component. These performer
+        // clips are authored to be played in place, but many carry a horizontal
+        // hips offset that walks the whole avatar forward/backward during the
+        // clip — then the fade-out pulls it back, reading as a "shrink"/jump at
+        // the end. Zeroing X/Z keeps jump/squat bobbing (Y) while the avatar
+        // stays rooted in place.
         positionTracks.filterKeys { it == HumanBoneName.HIPS }.forEach { (boneName, track) ->
             val p = sampleVec3(track, t)
             if (humanoid.getNormalizedBoneNode(boneName) != null) {
                 val poseIt = pose.getOrPut(boneName) { PoseTransform() }
-                poseIt.position = p
+                poseIt.position = Vec3(0f, p.y, 0f)
             }
         }
 
-        if (blendWeight < 1f) {
-            // Blend: read from the current humanoid pose and interpolate with blendWeight
+        // Fade-out: blend the SAMPLED pose toward the rest (identity)
+        // rig, then apply absolutely. Never blend toward the nodes'
+        // current values here — that self-reference would freeze the
+        // frozen half-step pose instead of relaxing to rest.
+        val fading = fadeOutRemaining > 0f
+        if (fading) {
+            val snap = restPose.orEmpty()
+            val progress = 1f - blendWeight
+            for ((boneName, p) in pose) {
+                val r = p.rotation
+                val restQ = snap[boneName] ?: Quat(0f, 0f, 0f, 1f)
+                if (r != null) {
+                    p.rotation = Quat().copy(r).slerp(restQ, progress).normalized()
+                }
+                if (boneName == HumanBoneName.HIPS && p.position != null) {
+                    val pp = p.position!!
+                    val rh = restHipsPos
+                    p.position = if (rh != null) Vec3(
+                        pp.x + (rh.x - pp.x) * progress,
+                        pp.y + (rh.y - pp.y) * progress,
+                        pp.z + (rh.z - pp.z) * progress,
+                    ) else Vec3(pp.x * blendWeight, pp.y * blendWeight, pp.z * blendWeight)
+                }
+            }
+            humanoid.setNormalizedPose(pose)
+        } else if (blendWeight < 1f) {
+            // Blend: interpolate toward the captured REST pose with blendWeight
+            // (blending toward the nodes' current values would just freeze the
+            // last clip frame — the fade target must be the rest pose).
             val currentPose = HashMap<String, PoseTransform>()
             for ((boneName, p) in pose) {
                 val node = humanoid.getNormalizedBoneNode(boneName) ?: continue
@@ -103,15 +238,17 @@ class VrmAnimationPlayer(
                 val rot = node.quaternion
                 val curPos = Vec3(pos.x, pos.y, pos.z)
                 val curRot = Quat(rot.x, rot.y, rot.z, rot.w)
-                val pPos = p.position ?: continue
-                val pRot = p.rotation ?: Quat(0f, 0f, 0f, 1f)
+                val pPos = p.position
+                val pRot = p.rotation
                 val blended = PoseTransform()
-                blended.position = Vec3(
-                    curPos.x + (pPos.x - curPos.x) * blendWeight,
-                    curPos.y + (pPos.y - curPos.y) * blendWeight,
-                    curPos.z + (pPos.z - curPos.z) * blendWeight,
-                )
-                blended.rotation = curRot.copy(curRot).slerp(pRot, blendWeight)
+                if (pPos != null) {
+                    blended.position = Vec3(
+                        curPos.x + (pPos.x - curPos.x) * blendWeight,
+                        curPos.y + (pPos.y - curPos.y) * blendWeight,
+                        curPos.z + (pPos.z - curPos.z) * blendWeight,
+                    )
+                }
+                if (pRot != null) blended.rotation = curRot.copy().slerp(pRot, blendWeight)
                 currentPose[boneName] = blended
             }
             humanoid.setNormalizedPose(currentPose)
@@ -120,10 +257,12 @@ class VrmAnimationPlayer(
         }
         humanoid.update()
 
-        for ((name, track) in weightTracks) {
-            val w = sampleScalar(track, t)
-            expressionManager?.setValue(name, w)
+        if (applyExpressions) {
+            sampledExpressionWeights().forEach { (name, weight) ->
+                expressionManager?.setValue(name, weight)
+            }
         }
+        if (finishedThisFrame && applyExpressions) clearOwnedExpressions()
 
         // lookAt track: world-space gaze-direction quaternion -> yaw/pitch applied to the lookAt controller
         val la = lookAt
@@ -137,6 +276,14 @@ class VrmAnimationPlayer(
         }
     }
 
+    /** Current expression contribution for external two-player composition. */
+    internal fun sampledExpressionWeights(): Map<String, Float> {
+        if (completed || duration <= 0f) return emptyMap()
+        return weightTracks.mapValues { (_, track) ->
+            (sampleScalar(track, time) * blendWeight).coerceIn(0f, 1f)
+        }
+    }
+
     private fun sampleQuat(track: KeyframeTrack, t: Float): dev.vrm.runtime.core.math.Quat {
         if (track.times.size == 1) {
             return dev.vrm.runtime.core.math.Quat(track.values[0], track.values[1], track.values[2], track.values[3]).normalized()
@@ -144,7 +291,7 @@ class VrmAnimationPlayer(
         val idx = findSegment(track, t)
         val t0 = track.times[idx]
         val t1 = track.times[idx + 1]
-        val u = if (t1 > t0) (t - t0) / (t1 - t0) else 0f
+        val u = if (t1 > t0) ((t - t0) / (t1 - t0)).coerceIn(0f, 1f) else 0f
         val k = 4
         val a = idx * k
         val b = (idx + 1) * k
@@ -164,7 +311,7 @@ class VrmAnimationPlayer(
         val idx = findSegment(track, t)
         val t0 = track.times[idx]
         val t1 = track.times[idx + 1]
-        val u = if (t1 > t0) (t - t0) / (t1 - t0) else 0f
+        val u = if (t1 > t0) ((t - t0) / (t1 - t0)).coerceIn(0f, 1f) else 0f
         val k = 4
         val a = idx * k
         val b = (idx + 1) * k
@@ -180,7 +327,7 @@ class VrmAnimationPlayer(
         val idx = findSegment(track, t)
         val t0 = track.times[idx]
         val t1 = track.times[idx + 1]
-        val u = if (t1 > t0) (t - t0) / (t1 - t0) else 0f
+        val u = if (t1 > t0) ((t - t0) / (t1 - t0)).coerceIn(0f, 1f) else 0f
         val k = 3
         val a = idx * k
         val b = (idx + 1) * k
@@ -196,7 +343,7 @@ class VrmAnimationPlayer(
         val idx = findSegment(track, t)
         val t0 = track.times[idx]
         val t1 = track.times[idx + 1]
-        val u = if (t1 > t0) (t - t0) / (t1 - t0) else 0f
+        val u = if (t1 > t0) ((t - t0) / (t1 - t0)).coerceIn(0f, 1f) else 0f
         return lerp(track.values[idx], track.values[idx + 1], u)
     }
 

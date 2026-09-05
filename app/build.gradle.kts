@@ -49,6 +49,7 @@ dependencies {
     // local pure-Kotlin VRM runtime + Filament adapter
     implementation(project(":vrm-core"))
     implementation(project(":vrm-adapter"))
+    implementation(project(":vrm-character"))
 
     // SceneView 2.3.3 = Filament 1.68.2 (comes transitively via :vrm-adapter)
     // Compose

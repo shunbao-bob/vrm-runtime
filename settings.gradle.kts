@@ -17,4 +17,5 @@ dependencyResolutionManagement {
 rootProject.name = "vrmruntime"
 include(":vrm-core")
 include(":vrm-adapter")
+include(":vrm-character")
 include(":app")

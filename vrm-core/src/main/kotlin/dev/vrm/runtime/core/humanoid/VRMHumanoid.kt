@@ -15,6 +15,9 @@ class VRMHumanoid private constructor(
     private val normalizedRig: VRMHumanoidRig,
     var autoUpdateHumanBones: Boolean = true,
 ) {
+    private val normalizedRestPositions: Map<String, Vec3> =
+        normalizedRig.normalizedBones.mapValues { (_, node) -> node.position.copy() }
+
     /** bone name -> glTF node index for the raw rig. */
     val rawHumanBones: Map<String, Int> get() = rawRig.humanBones
 
@@ -31,6 +34,7 @@ class VRMHumanoid private constructor(
 
     fun getRawBoneNodeIndex(name: String): Int? = rawRig.getBoneNodeIndex(name)
     fun getNormalizedBoneNode(name: String): RigNode? = normalizedRig.getBoneNode(name)
+    fun getNormalizedRestPosition(name: String): Vec3? = normalizedRestPositions[name]?.copy()
 
     /** Raw local pose relative to rest pose. */
     fun getRawPose(): Map<String, PoseTransform> = rawRig.getPose()
@@ -61,9 +65,9 @@ class VRMHumanoid private constructor(
     }
 
     fun resetNormalizedPose() {
-        // rest pose of normalized rig = world-relative offsets baked into positions;
-        // reset rotations to identity (T-pose), keep positions
-        normalizedRig.normalizedBones.forEach { (_, node) ->
+        // Rest pose = immutable normalized hierarchy offsets plus identity rotations.
+        normalizedRig.normalizedBones.forEach { (name, node) ->
+            normalizedRestPositions[name]?.let { node.position.copy(it) }
             node.quaternion.set(0f, 0f, 0f, 1f)
         }
     }

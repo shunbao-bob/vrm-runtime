@@ -45,7 +45,16 @@ class MtoonLoader(
             base.baseColorFactor?.let { if (it.size >= 4) p.colorFactor = it.take(4).toFloatArray() }
             base.baseColorTexture?.index?.let { p.baseColorTextureIndex = it }
         }
-        material?.normalTexture?.index?.let { p.normalMapIndex = it }
+        material?.normalTexture?.let { normal ->
+            normal.index?.let { p.normalMapIndex = it }
+            normal.scale?.let { p.normalScale = it }
+        }
+        material?.emissiveFactor?.let {
+            if (it.size >= 3) p.emissiveFactor = it.take(3).toFloatArray()
+        }
+        material?.emissiveTexture?.index?.let { p.emissiveTextureIndex = it }
+        material?.alphaCutoff?.let { p.alphaCutoff = it }
+        material?.doubleSided?.let { p.doubleSided = it }
 
         // ---- MToon schema fields ----
         extension.transparentWithZWrite?.let { p.transparentWithZWrite = it }

@@ -187,6 +187,8 @@ ResetPose / ResetExpression / StopVrma / StopSequence / RawPose / RawExpression�
 
 ## demo app
 
+> 🎬 **演示视频**：[`demo/demophone_effect_10s.mp4`](demo/demophone_effect_10s.mp4)
+
 `app` 模块是完整可运行的 Compose demo：
 
 - **模型选择器**：切换 `public/1.0` 同步的 42 个 VRM 1.0 模型（`avatars/` 8 个样例 + `models/` 34 个角色）

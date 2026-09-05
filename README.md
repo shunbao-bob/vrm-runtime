@@ -191,6 +191,8 @@ ResetPose / ResetExpression / StopVrma / StopSequence / RawPose / RawExpression.
 
 ## demo app
 
+> 🎬 **Demo video**: [`demo/demophone_effect_10s.mp4`](demo/demophone_effect_10s.mp4)
+
 The `app` module is a fully runnable Compose demo:
 
 - **Model picker**: switch among the 42 VRM 1.0 models synced from `public/1.0`

@@ -1,5 +1,10 @@
 package dev.vrm.runtime.core.controller
 
+import dev.vrm.runtime.core.motion.MotionSpec
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+
 /**
  * A unified imperative control layer for a VRM avatar, port of xlunar-ai-avatar's
  * `AvatarController` (AvatarController.ts). Engine-agnostic: commands are
@@ -18,6 +23,7 @@ package dev.vrm.runtime.core.controller
 class AvatarController(
     private val binding: AvatarBinding,
     private val config: AvatarConfig = AvatarConfig.EMPTY,
+    private val queueDispatcher: ((() -> Unit) -> Unit) = { it() },
 ) {
     private val listeners = HashMap<AvatarEventType, MutableList<(AvatarEvent) -> Unit>>()
     private val wildcardListeners = mutableListOf<(AvatarEvent) -> Unit>()
@@ -33,6 +39,7 @@ class AvatarController(
     @Volatile private var queueAborted = false
     private var queueCommands: List<AvatarCommand> = emptyList()
     private var queueThread: Thread? = null
+    private val queueGeneration = AtomicLong(0L)
 
     init {
         state = AvatarState(ready = true)
@@ -154,6 +161,52 @@ class AvatarController(
                     updateState { it.copy(expression = "raw(${command.values.size})") }
                     0
                 }
+
+                is AvatarCommand.MoveTo -> {
+                    binding.moveTo(command.x, command.z, command.y, command.speed, command.arrivalRadius)
+                    updateState { it.copy(bodyMotion = "moveTo(%.2f,%.2f)".format(command.x, command.z)) }
+                    0
+                }
+
+                is AvatarCommand.TurnTo -> {
+                    binding.turnTo(command.yawDegrees, command.turnSpeedDegPerSec)
+                    0
+                }
+
+                is AvatarCommand.MoveToAnchor -> {
+                    val anchor = config.anchorById(command.anchorId)
+                    if (anchor == null) {
+                        emitError("MoveToAnchor: unknown anchor '${command.anchorId}'")
+                    } else {
+                        binding.moveTo(anchor.x, anchor.z, anchor.y, command.speed, anchor.arrivalRadius)
+                        updateState { it.copy(bodyMotion = "anchor(${command.anchorId})") }
+                    }
+                    0
+                }
+
+                is AvatarCommand.SetWorldTransform -> {
+                    binding.setWorldTransform(command.x, command.y, command.z, command.yawDegrees)
+                    0
+                }
+
+                is AvatarCommand.StopMove -> {
+                    binding.stopMove(command.deceleration)
+                    0
+                }
+
+                is AvatarCommand.SetLocomotion -> {
+                    binding.setLocomotion(
+                        command.idle, command.walk, command.run,
+                        command.maxWalkSpeed, command.maxRunSpeed,
+                    )
+                    0
+                }
+
+                is AvatarCommand.PlayMotionSpec -> {
+                    binding.playMotionSpec(command.spec, command.loop)
+                    updateState { it.copy(vrmaSource = "spec:${command.spec.name}", vrmaPlaying = true) }
+                    0
+                }
             }
         } catch (e: Exception) {
             emitError("execute failed: ${e.message}")
@@ -170,36 +223,71 @@ class AvatarController(
      * Execute commands sequentially on a background thread, honoring
      * [AvatarCommand.Wait] durations. Abortable via [abortQueue].
      */
+    @Synchronized
     fun queue(commands: List<AvatarCommand>) {
         abortQueue()
-        queueCommands = commands
-        queueRunning = true
+        val generation = queueGeneration.incrementAndGet()
         queueAborted = false
-        emit(AvatarEventType.QUEUE_START, mapOf("length" to commands.size))
-        updateState { it.copy(queueLength = commands.size, queueRunning = true) }
+        try {
+            queueDispatcher {
+                try {
+                    if (queueGeneration.get() != generation || queueAborted) return@queueDispatcher
+                    queueCommands = commands
+                    queueRunning = true
+                    emit(AvatarEventType.QUEUE_START, mapOf("length" to commands.size))
+                    updateState { it.copy(queueLength = commands.size, queueRunning = true) }
 
-        queueThread = Thread({
-            for (cmd in queueCommands) {
-                if (!queueRunning || queueAborted) break
-                val blockMs = execute(cmd)
-                if (blockMs > 0) {
-                    try {
-                        Thread.sleep(blockMs)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
+                    queueThread = Thread({
+                        var failed = false
+                        for (cmd in commands) {
+                            if (!isQueueCurrent(generation)) break
+                            val dispatched = dispatchQueueAndWait(generation) { execute(cmd) }
+                            if (dispatched == null) {
+                                failed = true
+                                invalidateQueue(generation)
+                                break
+                            }
+                            val blockMs = dispatched.getOrElse {
+                                failed = true
+                                invalidateQueue(generation)
+                                0L
+                            }
+                            if (failed) break
+                            if (blockMs > 0) {
+                                try {
+                                    Thread.sleep(blockMs)
+                                } catch (_: InterruptedException) {
+                                    break
+                                }
+                            }
+                        }
+                        if (!failed && !dispatchQueue(generation) { finishQueue(generation) }) {
+                            invalidateQueue(generation)
+                        }
+                    }, "AvatarController-queue").apply { isDaemon = true; start() }
+                } catch (_: Throwable) {
+                    invalidateQueueStart(generation)
                 }
             }
-            finishQueue()
-        }, "AvatarController-queue").apply { isDaemon = true; start() }
+        } catch (_: Exception) {
+            invalidateQueue(generation)
+        }
     }
 
     /** Abort the currently running command queue. */
+    @Synchronized
     fun abortQueue() {
+        val generation = queueGeneration.incrementAndGet()
         queueAborted = true
         queueRunning = false
         queueThread?.interrupt()
         queueThread = null
+        dispatchQueue(generation) {
+            if (queueGeneration.get() == generation) {
+                queueCommands = emptyList()
+                updateState { it.copy(queueLength = 0, queueRunning = false) }
+            }
+        }
     }
 
     // ==========================================================================
@@ -216,6 +304,20 @@ class AvatarController(
     fun stopVrma() = execute(AvatarCommand.StopVrma)
     fun playSequence(id: String) = execute(AvatarCommand.SetSequence(id))
     fun stopSequence() = execute(AvatarCommand.StopSequence)
+
+    // ---- locomotion convenience ----
+    fun moveTo(x: Float, z: Float, speed: Float = 1.5f, arrivalRadius: Float = 0.15f) =
+        execute(AvatarCommand.MoveTo(x = x, z = z, speed = speed, arrivalRadius = arrivalRadius))
+    fun turnTo(yawDegrees: Float, turnSpeedDegPerSec: Float = 180f) =
+        execute(AvatarCommand.TurnTo(yawDegrees, turnSpeedDegPerSec))
+    fun moveToAnchor(anchorId: String, speed: Float = 1.5f) =
+        execute(AvatarCommand.MoveToAnchor(anchorId, speed))
+    fun teleportTo(x: Float, y: Float, z: Float, yawDegrees: Float = 0f) =
+        execute(AvatarCommand.SetWorldTransform(x, y, z, yawDegrees))
+    fun stopMove(deceleration: Float = 0.5f) = execute(AvatarCommand.StopMove(deceleration))
+    fun setLocomotion(idle: String? = null, walk: String? = null, run: String? = null) =
+        execute(AvatarCommand.SetLocomotion(idle, walk, run))
+
     fun reset() = execute(AvatarCommand.Reset)
 
     // ==========================================================================
@@ -270,13 +372,75 @@ class AvatarController(
     // internals
     // ==========================================================================
 
-    private fun finishQueue() {
+    private fun finishQueue(generation: Long) {
+        if (queueGeneration.get() != generation) return
         val wasRunning = queueRunning
         queueRunning = false
         queueCommands = emptyList()
         if (wasRunning && !queueAborted) {
             updateState { it.copy(queueLength = 0, queueRunning = false) }
             emit(AvatarEventType.QUEUE_COMPLETE, emptyMap())
+        }
+    }
+
+    private fun isQueueCurrent(generation: Long): Boolean =
+        queueGeneration.get() == generation && queueRunning && !queueAborted
+
+    /** Dispatch without letting a rejected/closed host executor escape a queue thread. */
+    private fun dispatchQueue(generation: Long, block: () -> Unit): Boolean = try {
+        queueDispatcher {
+            if (queueGeneration.get() == generation) block()
+        }
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * Dispatch one queue step and wait for it. The generation is checked again inside
+     * the host runnable so an already-posted command cannot execute after abortQueue().
+     */
+    private fun <T> dispatchQueueAndWait(generation: Long, block: () -> T): Result<T>? {
+        val latch = CountDownLatch(1)
+        var result: Result<T>? = null
+        try {
+            queueDispatcher {
+                try {
+                    result = if (isQueueCurrent(generation)) runCatching(block) else null
+                } finally {
+                    latch.countDown()
+                }
+            }
+        } catch (_: Exception) {
+            return null
+        }
+        val completed = try {
+            latch.await(30, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        return if (completed) result else null
+    }
+
+    private fun invalidateQueueStart(generation: Long) {
+        if (!queueGeneration.compareAndSet(generation, generation + 1)) return
+        queueAborted = true
+        queueRunning = false
+        queueThread = null
+        queueCommands = emptyList()
+        state = state.copy(queueLength = 0, queueRunning = false)
+    }
+
+    private fun invalidateQueue(generation: Long) {
+        if (!queueGeneration.compareAndSet(generation, generation + 1)) return
+        queueAborted = true
+        queueRunning = false
+        queueThread = null
+        val invalidatedGeneration = generation + 1
+        dispatchQueue(invalidatedGeneration) {
+            queueCommands = emptyList()
+            updateState { it.copy(queueLength = 0, queueRunning = false) }
         }
     }
 

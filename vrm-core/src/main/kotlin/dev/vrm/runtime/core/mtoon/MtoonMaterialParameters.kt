@@ -23,6 +23,14 @@ data class MtoonMaterialParameters(
     var normalMapIndex: Int? = null,
     /** Normal scale (x = strength, y unused). */
     var normalScale: Float = 1f,
+    /** Emissive color multiplier from the underlying glTF material. */
+    var emissiveFactor: FloatArray = floatArrayOf(0f, 0f, 0f),
+    /** Emissive texture index, or null. */
+    var emissiveTextureIndex: Int? = null,
+    /** Alpha cutoff used by MASK materials. */
+    var alphaCutoff: Float = 0.5f,
+    /** Whether both faces should be rendered. */
+    var doubleSided: Boolean = false,
 
     // ---- MToon spec fields (from VRMC_materials_mtoon) ----
     /** Whether to write to depth when the material is transparent. */
@@ -113,6 +121,10 @@ fun MtoonMaterialParameters.copyShallow(): MtoonMaterialParameters {
     c.baseColorTextureIndex = baseColorTextureIndex
     c.normalMapIndex = normalMapIndex
     c.normalScale = normalScale
+    c.emissiveFactor = emissiveFactor.copyOf()
+    c.emissiveTextureIndex = emissiveTextureIndex
+    c.alphaCutoff = alphaCutoff
+    c.doubleSided = doubleSided
     c.transparentWithZWrite = transparentWithZWrite
     c.renderQueueOffsetNumber = renderQueueOffsetNumber
     c.shadeColorFactor = shadeColorFactor.copyOf()

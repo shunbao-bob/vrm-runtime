@@ -37,14 +37,22 @@ class MToonMaterialApplier(
     instance: FilamentInstance,
     private val gltf: Gltf,
     private val binary: ByteArray?,  // GLB BIN chunk (source of texture PNG bytes)
+    /** Direction pointing FROM the surface TOWARD the scene directional light.
+     *  This is the negation of StageConfig.directionalLightPosition (which is
+     *  the light propagation direction). The shader's lightDir must track the
+     *  configured stage light, otherwise the MToon cel shading stays stuck on
+     *  the mat's hardcoded default and ignores host light changes. */
+    private val lightDir: FloatArray = floatArrayOf(0f, -0.2f, 1f),
 ) {
     private val renderableManager: RenderableManager = engine.renderableManager
     private val asset: FilamentAsset = instance.getAsset()
 
     /** Cache of blending variant name -> Material. */
     private val materialCache = HashMap<String, Material>()
-    /** Cache of glTF texture index -> Filament Texture. */
-    private val textureCache = HashMap<Int, Texture>()
+    private enum class TextureColorSpace { SRGB, LINEAR }
+
+    /** A texture can be sampled as color or data, so color space is part of the cache key. */
+    private val textureCache = HashMap<Pair<Int, TextureColorSpace>, Texture>()
 
     /** The .filamat bytes of the three blending variants. */
     class Filamat(
@@ -95,12 +103,26 @@ class MToonMaterialApplier(
                 "BLEND" -> "transparent"
                 else -> "opaque"
             }
-            val m = materials[matName] ?: materials["opaque"]!!
+            val m = materials[matName] ?: materials.values.firstOrNull() ?: return@forEachIndexed
             val mi = m.createInstance()
+            instances.add(mi)
             val params = paramsByMat[matIdx] ?: MtoonMaterialParameters()
             bindParams(m, mi, params)
-            bindTexture(m, mi, "baseColorMap", params.baseColorTextureIndex)
-            bindTexture(m, mi, "shadeMap", params.shadeMultiplyTextureIndex)
+            // Filament only generates the internal _maskThreshold uniform for
+            // materials compiled with blending: masked. Calling this setter on
+            // opaque/transparent materials is a native PreconditionPanic.
+            if (matName == "masked") mi.setMaskThreshold(params.alphaCutoff)
+            mi.setDoubleSided(params.doubleSided)
+            mi.setDepthWrite(matName != "transparent" || params.transparentWithZWrite)
+            bindTexture(m, mi, "baseColorMap", params.baseColorTextureIndex, TextureColorSpace.SRGB)
+            bindTexture(m, mi, "shadeColorMap", params.shadeMultiplyTextureIndex, TextureColorSpace.SRGB)
+            bindTexture(m, mi, "normalMap", params.normalMapIndex, TextureColorSpace.LINEAR)
+            bindTexture(m, mi, "shadingShiftMap", params.shadingShiftTextureIndex, TextureColorSpace.LINEAR)
+            bindTexture(m, mi, "matcapTexture", params.matcapTextureIndex, TextureColorSpace.SRGB)
+            bindTexture(m, mi, "rimMultiplyTexture", params.rimMultiplyTextureIndex, TextureColorSpace.SRGB)
+            bindTexture(m, mi, "emissiveMap", params.emissiveTextureIndex, TextureColorSpace.SRGB)
+            bindTexture(m, mi, "uvAnimationMaskTexture", params.uvAnimationMaskTextureIndex, TextureColorSpace.LINEAR)
+            animatedInstances.add(AnimatedMaterial(mi, params))
             miByMat[matIdx] = mi
         }
 
@@ -121,6 +143,15 @@ class MToonMaterialApplier(
                 val mi = if (matIdx != null) miByMat[matIdx] else null
                 if (mi != null) {
                     renderableManager.setMaterialInstanceAt(renderable, p, mi)
+                    val params = matIdx?.let { paramsByMat[it] }
+                    if (matIdx != null && gltf.materials?.getOrNull(matIdx)?.alphaMode?.uppercase() == "BLEND" && params != null) {
+                        // Preserve three-vrm's relative renderOrder for transparent
+                        // primitives. Filament's blend order is unsigned; center the
+                        // VRM range (-9..9) around 128.
+                        val blendOrder = (128 + params.renderQueueOffsetNumber).coerceIn(0, 255)
+                        renderableManager.setBlendOrderAt(renderable, p, blendOrder)
+                        renderableManager.setGlobalBlendOrderEnabledAt(renderable, p, true)
+                    }
                     bound++
                 }
                 replaced++
@@ -137,18 +168,119 @@ class MToonMaterialApplier(
         }
     }
 
+    /** 1x1 white fallback texture, bound when a MToon material declares a sampler
+     *  but has no texture (or its texture can't be decoded). The shader samples
+     *  baseColorMap/shadeColorMap unconditionally; an unbound Filament sampler samples
+     *  as black, which would zero out baseColorFactor/shadeColorFactor for
+     *  texture-less materials. Binding white keeps the factor-only color path. */
+    private var whiteTexture: Texture? = null
+    private var blackTexture: Texture? = null
+    private var neutralNormalTexture: Texture? = null
+
+    /** MaterialInstance created per MToon glTF material index (for explicit destroy). */
+    private val instances = ArrayList<MaterialInstance>()
+
+    private data class AnimatedMaterial(
+        val instance: MaterialInstance,
+        val params: MtoonMaterialParameters,
+        var scrollX: Float = 0f,
+        var scrollY: Float = 0f,
+        var rotation: Float = 0f,
+    )
+
+    private val animatedInstances = ArrayList<AnimatedMaterial>()
+
+    /** Advance VRMC_materials_mtoon UV scroll/rotation using three-vrm's phase convention. */
+    fun update(deltaSeconds: Float) {
+        if (deltaSeconds <= 0f) return
+        for (state in animatedInstances) {
+            state.scrollX += state.params.uvAnimationScrollXSpeedFactor * deltaSeconds
+            state.scrollY += state.params.uvAnimationScrollYSpeedFactor * deltaSeconds
+            state.rotation += state.params.uvAnimationRotationSpeedFactor * deltaSeconds
+            state.instance.setParameter("uvAnimationOffset", state.scrollX, state.scrollY)
+            state.instance.setParameter("uvAnimationRotation", state.rotation)
+        }
+    }
+
+    /**
+     * Destroy every Filament object this applier created, in the safe order:
+     * MaterialInstances first, then Materials, then Textures.
+     *
+     * WHY (crash fix): Filament's Java bindings release native Material /
+     * MaterialInstance via finalizers when the wrapping object is GC'd. If the
+     * applier just goes out of scope (it's a local in loadModel), a GC cycle
+     * may run Material's finalizer while its MaterialInstances are still
+     * alive -> native PreconditionPanic: "destroying material X but N
+     * instances still alive" -> SIGABRT. We must own them and destroy them
+     * explicitly, AFTER the owning ModelNode has been destroyed (so the
+     * renderables no longer reference the instances).
+     */
+    fun destroy() {
+        for (mi in instances) {
+            runCatching { engine.destroyMaterialInstance(mi) }
+        }
+        instances.clear()
+        animatedInstances.clear()
+        for (mat in materialCache.values) {
+            runCatching { engine.destroyMaterial(mat) }
+        }
+        materialCache.clear()
+        for (tex in textureCache.values) {
+            runCatching { engine.destroyTexture(tex) }
+        }
+        textureCache.clear()
+        whiteTexture?.let { runCatching { engine.destroyTexture(it) } }
+        blackTexture?.let { runCatching { engine.destroyTexture(it) } }
+        neutralNormalTexture?.let { runCatching { engine.destroyTexture(it) } }
+        whiteTexture = null
+        blackTexture = null
+        neutralNormalTexture = null
+    }
+
     /** Bind the decoded Texture for a glTF texture index onto a material instance sampler (only if the shader declares the sampler). */
-    private fun bindTexture(m: Material, mi: MaterialInstance, param: String, textureIndex: Int?) {
-        if (textureIndex == null) return
-        if (!m.hasParameter(param)) return
-        val tex = decodeTexture(textureIndex) ?: return
-        mi.setParameter(param, tex,
+    private fun bindTexture(
+        m: Material,
+        mi: MaterialInstance,
+        param: String,
+        textureIndex: Int?,
+        colorSpace: TextureColorSpace,
+    ) {
+        if (!m.hasParameter(param)) {
+            android.util.Log.w("MToon", "bindTexture: material has no param '$param'")
+            return
+        }
+        val tex = textureIndex?.let { decodeTexture(it, colorSpace) }
+        val effective = tex ?: fallbackTexture(param)
+        android.util.Log.i("MToon", "bindTexture: $param idx=$textureIndex -> ${if (tex != null) "real(tex@${System.identityHashCode(tex)})" else "fallback"}")
+        mi.setParameter(param, effective,
             TextureSampler(TextureSampler.MinFilter.LINEAR, TextureSampler.MagFilter.LINEAR, TextureSampler.WrapMode.REPEAT))
     }
 
+    private fun fallbackTexture(param: String): Texture = when (param) {
+        "normalMap" -> neutralNormalTexture
+            ?: createSolidTexture(128, 128, 255, TextureColorSpace.LINEAR).also { neutralNormalTexture = it }
+        "shadingShiftMap", "matcapTexture" -> blackTexture
+            ?: createSolidTexture(0, 0, 0, TextureColorSpace.LINEAR).also { blackTexture = it }
+        else -> whiteTexture
+            ?: createSolidTexture(255, 255, 255, TextureColorSpace.SRGB).also { whiteTexture = it }
+    }
+
+    private fun createSolidTexture(r: Int, g: Int, b: Int, colorSpace: TextureColorSpace): Texture {
+        val buf = ByteBuffer.allocateDirect(4).order(ByteOrder.nativeOrder())
+        buf.put(r.toByte()).put(g.toByte()).put(b.toByte()).put(255.toByte())
+        buf.rewind()
+        return Texture.Builder()
+            .width(1).height(1).levels(1)
+            .format(if (colorSpace == TextureColorSpace.SRGB) Texture.InternalFormat.SRGB8_A8 else Texture.InternalFormat.RGBA8)
+            .sampler(Texture.Sampler.SAMPLER_2D)
+            .build(engine)
+            .also { it.setImage(engine, 0, Texture.PixelBufferDescriptor(buf, Texture.Format.RGBA, Texture.Type.UBYTE, 1)) }
+    }
+
     /** Extract the texture for a glTF texture index from the GLB and decode it into a Filament Texture. */
-    private fun decodeTexture(textureIndex: Int): Texture? {
-        textureCache[textureIndex]?.let { return it }
+    private fun decodeTexture(textureIndex: Int, colorSpace: TextureColorSpace): Texture? {
+        val key = textureIndex to colorSpace
+        textureCache[key]?.let { return it }
         val tex = gltf.textures?.getOrNull(textureIndex) ?: return null
         val imgIdx = tex.source ?: return null
         val img = gltf.images?.getOrNull(imgIdx) ?: return null
@@ -160,9 +292,9 @@ class MToonMaterialApplier(
             android.util.Log.w("MToon", "BitmapFactory failed to decode image ${img.name}")
             return null
         }
-        val t = bitmapToTexture(bitmap)
+        val t = bitmapToTexture(bitmap, colorSpace)
         bitmap.recycle()
-        textureCache[textureIndex] = t
+        textureCache[key] = t
         return t
     }
 
@@ -183,32 +315,37 @@ class MToonMaterialApplier(
     }
 
     /** Android Bitmap -> Filament Texture (RGBA8). */
-    private fun bitmapToTexture(bmp: Bitmap): Texture {
+    private fun bitmapToTexture(bmp: Bitmap, colorSpace: TextureColorSpace): Texture {
         val w = bmp.width
         val h = bmp.height
         val rgba = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
         val pix = IntArray(w * h)
         bmp.getPixels(pix, 0, w, 0, 0, w, h)
-        for (px in pix) {
-            rgba.put((px shr 16 and 0xFF).toByte())
-            rgba.put((px shr 8 and 0xFF).toByte())
-            rgba.put((px and 0xFF).toByte())
-            rgba.put((px ushr 24 and 0xFF).toByte())
+        // Android Bitmap rows are top-to-bottom, while glTF UVs uploaded through
+        // Filament's raw PixelBufferDescriptor expect the first row at the
+        // texture's bottom. Flip only the row order; keep RGBA channel order.
+        for (y in h - 1 downTo 0) {
+            val row = y * w
+            for (x in 0 until w) {
+                val px = pix[row + x]
+                rgba.put((px shr 16 and 0xFF).toByte())
+                rgba.put((px shr 8 and 0xFF).toByte())
+                rgba.put((px and 0xFF).toByte())
+                rgba.put((px ushr 24 and 0xFF).toByte())
+            }
         }
         rgba.rewind()
         val tex = Texture.Builder()
             .width(w).height(h).levels(1)
-            // sRGB texture: BitmapFactory decodes sRGB-encoded bytes, so use
-            // SRGB8_A8 to let Filament decode to linear on sampling, avoiding
-            // the washed-out double gamma of treating sRGB data as linear
-            .format(Texture.InternalFormat.SRGB8_A8)
+            // Color maps use sRGB decoding; normal and scalar data maps stay linear.
+            .format(if (colorSpace == TextureColorSpace.SRGB) Texture.InternalFormat.SRGB8_A8 else Texture.InternalFormat.RGBA8)
             .sampler(Texture.Sampler.SAMPLER_2D)
             .build(engine)
         tex.setImage(engine, 0, Texture.PixelBufferDescriptor(rgba, Texture.Format.RGBA, Texture.Type.UBYTE, 1))
         return tex
     }
 
-    /** Bind the parsed MToon parameters onto the material instance's uniforms (only if the shader declares the uniform). */
+       /** Bind the parsed MToon parameters onto the material instance's uniforms (only if the shader declares the uniform). */
     private fun bindParams(m: Material, mi: MaterialInstance, p: MtoonMaterialParameters) {
         if (m.hasParameter("baseColorFactor"))
             mi.setParameter("baseColorFactor", p.colorFactor[0], p.colorFactor[1], p.colorFactor[2], p.colorFactor[3])
@@ -216,5 +353,27 @@ class MToonMaterialApplier(
             mi.setParameter("shadeColorFactor", p.shadeColorFactor[0], p.shadeColorFactor[1], p.shadeColorFactor[2])
         if (m.hasParameter("shadingShift")) mi.setParameter("shadingShift", p.shadingShiftFactor)
         if (m.hasParameter("shadingToony")) mi.setParameter("shadingToony", p.shadingToonyFactor)
+        if (m.hasParameter("shadingShiftTextureScale")) mi.setParameter("shadingShiftTextureScale", p.shadingShiftTextureScale)
+        if (m.hasParameter("normalScale")) mi.setParameter("normalScale", p.normalScale)
+        if (m.hasParameter("giEqualization")) mi.setParameter("giEqualization", p.giEqualizationFactor)
+        if (m.hasParameter("matcapFactor"))
+            mi.setParameter("matcapFactor", p.matcapFactor[0], p.matcapFactor[1], p.matcapFactor[2])
+        if (m.hasParameter("parametricRimColorFactor"))
+            mi.setParameter("parametricRimColorFactor", p.parametricRimColorFactor[0], p.parametricRimColorFactor[1], p.parametricRimColorFactor[2])
+        if (m.hasParameter("rimLightingMix")) mi.setParameter("rimLightingMix", p.rimLightingMixFactor)
+        if (m.hasParameter("rimFresnelPower")) mi.setParameter("rimFresnelPower", p.parametricRimFresnelPowerFactor)
+        if (m.hasParameter("rimLift")) mi.setParameter("rimLift", p.parametricRimLiftFactor)
+        if (m.hasParameter("emissiveFactor"))
+            mi.setParameter("emissiveFactor", p.emissiveFactor[0], p.emissiveFactor[1], p.emissiveFactor[2])
+        if (m.hasParameter("lightDir")) mi.setParameter("lightDir", lightDir[0], lightDir[1], lightDir[2])
+        // Mirror text-to-vrma viewer.js exactly:
+        // DirectionalLight(0xffffff, PI * 0.9)
+        // AmbientLight(0xbfd4ff, PI * 0.35)
+        // Filament MaterialInstance parameters must be initialized explicitly;
+        // relying on .mat defaults leaves these uniforms at zero on device.
+        if (m.hasParameter("lightColor"))
+            mi.setParameter("lightColor", 2.8274333f, 2.8274333f, 2.8274333f)
+        if (m.hasParameter("ambientColor"))
+            mi.setParameter("ambientColor", 0.8235901f, 0.9141419f, 1.0995574f)
     }
 }

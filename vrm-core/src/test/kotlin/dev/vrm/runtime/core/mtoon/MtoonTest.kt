@@ -112,4 +112,31 @@ class MtoonTest {
         val expected = Math.pow(((0.3012 + 0.055) / 1.055).toDouble(), 2.4).toFloat()
         assertEquals(expected, converted.shadeColorFactor[0], 1e-4f)
     }
+
+    @Test
+    fun `merges normal emission and alpha properties from gltf material`() {
+        val gltf = dev.vrm.runtime.core.gltf.Gltf(
+            materials = listOf(
+                dev.vrm.runtime.core.gltf.Material(
+                    normalTexture = dev.vrm.runtime.core.gltf.TextureInfo(index = 4, scale = 0.35f),
+                    emissiveTexture = dev.vrm.runtime.core.gltf.TextureInfo(index = 5),
+                    emissiveFactor = listOf(0.1f, 0.2f, 0.3f),
+                    alphaCutoff = 0.42f,
+                    doubleSided = false,
+                ),
+            ),
+        )
+        val schema = dev.vrm.runtime.core.vrm.VrmcMaterialsMtoon()
+
+        val p = MtoonLoader(gltf, mapOf(0 to schema)).load(0)!!
+
+        assertEquals(4, p.normalMapIndex)
+        assertEquals(0.35f, p.normalScale, 1e-6f)
+        assertEquals(5, p.emissiveTextureIndex)
+        assertEquals(0.1f, p.emissiveFactor[0], 1e-6f)
+        assertEquals(0.2f, p.emissiveFactor[1], 1e-6f)
+        assertEquals(0.3f, p.emissiveFactor[2], 1e-6f)
+        assertEquals(0.42f, p.alphaCutoff, 1e-6f)
+        assertEquals(false, p.doubleSided)
+    }
 }
