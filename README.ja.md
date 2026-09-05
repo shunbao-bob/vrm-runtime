@@ -27,16 +27,29 @@ vrmruntime/
 ├── vrm-adapter/                 Android ライブラリ（Filament/SceneView バインド層、vrm-core の上位に位置）
 │   └── src/main/java/dev/vrm/runtime/adapter/
 │       ├── AvatarEngineController.kt   エンジンコントローラー（AvatarBinding 実装 + 口型）
-│       ├── AvatarRenderer.kt           adapter のメインエントリ（loadModel / applyStage / update）
-│       ├── StageConfig.kt              xlunar スタイルのライティング/シーン設定
-│       ├── VrmAnimationPlayer.kt       VRMA プレイヤー
-│       └── filament/                   FilamentNodeTransformStore / SpringBoneStore / ExpressionBindProvider
-└── app/                         demo（Compose + SceneView/Filament、:vrm-adapter のみに依存）
-    └── src/main/java/dev/vrm/runtime/demo/
-        ├── VrmDemoScreen.kt            xlunar スタイル：左ビューポート + 右タブ操作パネル
-        ├── DemoAssets.kt               モデル/VRMA/表情リソースマニフェスト
-        └── MainActivity.kt
+│       ├── AvatarRenderer.kt           adapter のメインエントリ（loadModel/loadModelAsync / applyStage / update）
+│       ├── StageConfig.kt              ライティング/シーン設定
+│       ├── VrmAnimationPlayer.kt       リアルタイム VRMA プレイヤー（TransformManager でボーン書き込み）
+│       └── filament/                   FilamentNodeTransformStore / SpringBoneStore / MToonMaterialApplier
+├── app/                         メイン横画面 demo（Compose + SceneView/Filament、:vrm-adapter に依存）
+│   └── src/main/java/dev/vrm/runtime/demo/
+│       ├── VrmDemoScreen.kt            xlunar スタイル：左ビューポート + 右タブ操作パネル
+│       ├── DemoAssets.kt               モデル/VRMA/表情リソースマニフェスト
+│       └── MainActivity.kt
+├── vrm-character/               エンジン非依存のキャラクター挙動層（JVM：感情、動作、口型、待機、徜徉 AI、SceneConfig）
+│   └── src/main/kotlin/dev/vrm/runtime/character/
+└── demoPhone/                   携帯縦長の AI 仮想ヒューマンアシスタント（Compose + SceneView）
+    └── src/main/java/dev/vrm/runtime/phonephone/
+        ├── PhoneDemoScreen.kt          縦長 UI + カメラ + STT/TTS
+        ├── PhoneViewModel.kt           LLM 対話 + 表情/ジェスチャー/アニメーション配信 + 口型
+        ├── PhoneAssets.kt              携帯用アセット一覧（モデル / 音声 / 環境）
+        ├── brain/                      AssistantBrain + KeywordAssistantBrain
+        └── voice/                      NUI（Alibaba）STT/TTS + 再生ゲート
 ```
+
+> 注：`vrm-character` はエンジン非依存の待機/動作層で、両デモで共用します。`demoPhone`
+> は縦長 AI アシスタント app で、クローズドソースの阿里雲 `nuisdk-release.aar` を同梱
+> しているためローカルの開発専用（公開/配布対象ではありません）。
 
 ## 環境
 
@@ -48,22 +61,26 @@ vrmruntime/
 
 ## 導入ガイド（ライブラリの利用）
 
-### 0. 依存座標（maven 配布）
+### 0. 依存座標（Maven 配布）
 
-`vrm-core` は `maven-publish` を設定済みで、座標は `dev.vrm.runtime:vrm-core:1.0.0` です：
+3 つのライブラリすべてが `maven-publish` 済みです（groupId `dev.vrm.runtime`）：
 
-```bash
-./gradlew :vrm-core:publishToMavenLocal     # ローカル ~/.m2 に公開
-```
+| モジュール | 座標 | タイプ | 公開コマンド                                  |
+|---|---|---|---|
+| vrm-core | `dev.vrm.runtime:vrm-core:1.0.0` | jar | `./gradlew :vrm-core:publishToMavenLocal`     |
+| vrm-character | `dev.vrm.runtime:vrm-character:1.0.0` | jar | `./gradlew :vrm-character:publishToMavenLocal` |
+| vrm-adapter | `dev.vrm.runtime:vrm-adapter:1.0.0` | aar | `./gradlew :vrm-adapter:publishToMavenLocal`   |
 
 ホストプロジェクト（JVM / Android）側の依存：
 
 ```kotlin
 // settings.gradle.kts で mavenCentral + mavenLocal() にアクセスできる必要があります
-implementation("dev.vrm.runtime:vrm-core:1.0.0")
+implementation("dev.vrm.runtime:vrm-core:1.0.0")        // 純粋エンジン（JVM/Android）
+implementation("dev.vrm.runtime:vrm-adapter:1.0.0")    // Filament/SceneView バインド（Android）
+implementation("dev.vrm.runtime:vrm-character:1.0.0")  // キャラクター挙動層（JVM/Android）
 ```
 
-公開構成：jar + pom + Gradle module metadata は `publishing { MavenPublication("maven") }` が自動生成します。リモートリポジトリ（例：Maven Central）へプッシュするには `publishing.repositories` に該当リポジトリを追加し、必要に応じて署名を設定します。
+公開構成：jar/aar + pom + Gradle module metadata は `publishing { MavenPublication(...) }` が自動生成します。リモートリポジトリ（例：Maven Central）へプッシュするには `publishing.repositories` に該当リポジトリを追加し、必要に応じて署名を設定します。
 
 ### 1. VRM の解析
 
@@ -171,27 +188,55 @@ avatar.onVrmaComplete()          // プレイヤー終了後にホストから�
 
 ## デモアプリ
 
-> 🎬 **デモ動画**: [`demo/demophone_effect_10s.mp4`](demo/demophone_effect_10s.mp4)
+`app` モジュールは完全に実行可能な横画面 Compose デモです：
 
-`app` モジュールは完全に実行可能な Compose デモです：
-
-- **モデルセレクター**：`public/1.0` で同期した 42 個の VRM 1.0 モデルを切替（`avatars/` の 8 サンプル + `models/` の 34 キャラクター）
+- **モデルセレクター**：42 個の VRM 1.0 モデルを切替（`avatars/` の 8 サンプル + `models/` の 34 キャラクター）
 - **Pose**：静的ポーズ、ジェスチャーエイリアス、ボディモーションの入口、ポーズのリセット
 - **Combos**：多段階ポーズ + 表情の演出（friendly greeting / thinking eureka / explaining など）
-- **VRMA**：20 個の VRMA、ソースファイルに応じたデフォルト loop、手動 loop のオン/オフ、停止
+- **VRMA**：20 個の VRMA、リアルタイム再生（GLB ベイクなし）、手動 loop のオン/オフ、停止
 - **Face**：標準 VRM 表情を項目ごとに 0..1 スライダーで操作（happy / sad / mouth / blink / lookAt）
-- **Scene**：環境光、方向光、カメラ距離、自動 LookAt のオン/オフ
-- **表情パネル**（右下）：preset 表情スライダーで morph ウェイトをリアルタイム駆動
+- **Scene**：環境光、方向光、カメラ距離、自動 LookAt、環境切替（Studio / Ferndale / Brown）
 - **スプリングボーンのオン/オフ** / **LookAt 追従**：髪・スカートの物理、視線追跡
-- **VRMA の再生/一時停止** + モデル名/状態の表示
 
-> デモアセットは [xlunar-ai-avatar](https://github.com/iamenahs/xlunar-ai-avatar) の `public/1.0` ディレクトリから同期：`app/src/main/assets/avatars/`（8 サンプル VRM）、`models/`（34 キャラクター VRM）、`animations/`（20 VRMA）。`DemoAssets` の source key はこれら 3 ディレクトリと一致しています。
+すべてのアニメーション/ポーズ/組み合わせは**リアルタイム VRMA 駆動**（`VrmAnimationPlayer`）で、
+毎フレームボーンのローカル回転を `TransformManager` へ書き込み、`updateBoneMatrices()` で
+スキニングを駆動します——**GLB ベイクなし・モデル再構築なし・再ロード競合なし**。アニメーションは
+フェードイン/アウトが滑らかで、再生後は自然な relaxed 立ち姿勢（呼吸 + ランダムな瞬き + 微細動作）へ
+戻り、ワンショット clip は最終フレームに凍結せずに緩やかに復帰します。
 
-> ⚠️ **環境マップは必須アセットです**：demo は `assets/environments/neutral/neutral_ibl.ktx` + `neutral_skybox.ktx` を IBL 環境光として利用します。SceneView の `createKTX1Environment(iblAssetFile=…)` は **app 自身の assets** から読み取ります（ライブラリの assets ではありません）。この 2 ファイルがないとシーンに環境光がなく、**モデルが黒く描画されます**。ファイルは SceneView 2.3.3 AAR 内の `assets/environments/neutral/` から取得しています（`sh.txt` に由来を記録）。また、シーンに `LightNode`（Directional）を追加してモデルを明るくすることもできます。
+デモアセット：`app/src/main/assets/avatars/`（8 サンプル VRM）、`models/`（34 キャラクター VRM）、
+`animations/`（20 VRMA）、`environments/`（3 組の IBL＋skybox）。
 
-> ⚠️ **車載の横画面では landscape 宣言が必須**：AndroidManifest で `MainActivity` の `android:screenOrientation` は `landscape`（または `unspecified`）にする必要があります。`portrait` を指定すると、1920x720 の横画面車載端末ではシステムによって **letterbox され、右 270px の細い帯に押し込まれます**（ウィンドウ bounds=[825,0][1095,720]、ComposeView が 0x0-0x48 に潰れる）。「モデルは見えるが UI パネルがすべて消える」という症状になります。`landscape` にすれば全画面で正常動作します。
+> ⚠️ **環境マップは必須アセットです**：demo は `assets/environments/*/*_ibl.ktx` + `*_skybox.ktx`
+> （Studio / Ferndale Studio / Brown Photo Studio）を IBL 環境光として利用します。このファイルが
+> ないとシーンに環境光がなく、**モデルが黒く描画されます**。
+>
+> ⚠️ メイン demo は横画面です。状況に応じて AndroidManifest で `screenOrientation`（または
+> `unspecified`）を設定してください。
 
 ビルド：`./gradlew :app:assembleDebug`、APK は `app/build/outputs/apk/debug/` に出力されます。
+
+## demoPhone（AI 仮想ヒューマンアシスタント）
+
+同じ `vrm-adapter` を土台とした**縦長・音声駆動のアシスタント app**（Compose + SceneView）——
+音声対話（阿里雲 STT/TTS）で、仮想ヒューマンがリアルタイムに口型同期・表情・ジェスチャー・
+LLM が選んだ VRMA アニメーションを再生します。
+
+![demoPhone effect](demo/demophone_effect.gif)
+
+ハイライト：
+
+- **音声対話ループ**：STT → AI 応答 → TTS（字幕フレームで口型駆動）。
+- **LLM 表情/ジェスチャー/アニメーションプロトコル**：system prompt が、現在サポートしている
+  プリセット群（表情・ジェスチャー・20 VRMA）から標準の `[表情:xxx]` / `[動作:xxx]` タグを選ぶよう
+  LLM に要求。クライアントは発話前にタグを除去し、対応する顔/ジェスチャー/clip を再生します
+  （タグが無い場合は本文のキーワードからも対応を推測）。
+- **口型同期**は阿里雲の字幕タイムスタンプを基に、実際の再生開始点を基準に少量の先行オフセットを
+  加えて音声に一致させます。
+- 完全な 10 秒エフェクト録画は `demo/demophone_effect_10s.mp4` を参照。
+
+クローズドソースの阿里雲 `nuisdk-release.aar` を同梱するため、`demoPhone` は公開/配布
+モジュール群には含まれません（ローカル開発専用）。
 
 ## テスト
 
@@ -231,9 +276,10 @@ avatar.onVrmaComplete()          // プレイヤー終了後にホストから�
 - [x] Humanoid：raw rig の読み書き / ノーマライズドリグ / rest 姿勢の捕捉
 - [x] Expressions：ウェイトのクランプ / isBinary / override グループ（blink/lookAt/mouth）/ morph+マテリアル+UV bind
 - [x] SpringBone：Verlet 積分 / stiffness / gravity / drag / 衝突押し出し / 深さソート
-- [x] MToon：sRGB opt-in 変換、shouldGenerateOutline、renderOrder
+- [x] MToon：sRGB opt-in 変換、renderOrder、Filament セルシェーダー
 - [x] LookAt：yaw/pitch / bone + expression applier / range map / faceFront
-- [x] demo アプリ：表情パネル + スプリングボーン切替 + LookAt 追従 + VRMA 再生
+- [x] リアルタイム VRMA 再生（TransformManager ボーン書き込み + updateBoneMatrices）+ スムーズな待機/遷移
+- [x] demoPhone：STT/TTS、LLM タグ解析、口型同期
 
 ## 既知の未対応項目 / 制限
 
@@ -249,13 +295,47 @@ avatar.onVrmaComplete()          // プレイヤー終了後にホストから�
 - `FilamentNodeTransformStore.parentNodeIndex` を修正済み：gltf nodes を渡して nodeIndex→parent のマッピングを構築し、`parentNodeIndex` が実際の親子関係を返すようにしました（bone 型 LookAt / springbone center / ノーマライズドリグの親ワールド回転補正を修正）。
 - VRMA の lookAt トラック（`lookAt.quaternion`）は `VrmAnimationPlayer` で消費済み：ワールド空間の視線 quaternion をサンプリング → yaw/pitch に変換 → VrmLookAt コントローラーへ適用（`VrmAnimationPlayer.apply`。lookAt が渡された場合に有効）。
 - 表情のマテリアルカラー / UV 変換 bind は、demo の `FilamentExpressionBindProvider` でマテリアル属性ごとに実装しています。該当属性がシェーダーで宣言されていない場合はその bind をスキップします。
-- スプリングボーンの衝突は現在 3 つの球体で近似しています（capsule は 2 点 + 半径）。three-vrm の挙動と一致します。
-- **VRoid/xlunar モデルのスケルトン根チェーン問題（解決済み）**：初期の gltfio は「独立スケルトン根 + 単一共有 skin」構造の関節ワールド行列を誤って計算していました（VRoid のスケルトン根 `Root(90°回転)→Global→Position→Hips` が誤って統合され、hips のワールド y≈0.08、脚が逆さまに交差）。**「VRMA をモデル GLB へベイク + gltfio Animator 駆動」で解決済み**：アニメーション/ポーズがリターゲット後のボーンローカル回転をモデル内蔵の glTF アニメーションとしてベイクし、`Animator.applyAnimation` + `updateBoneMatrices` でスキニングを駆動するため、VRoid の脚交差は解消されました。**08-24 修正**：検証の結果、**TransformManager による直接駆動も公式サポートされたチャンネル**であることが判明しました（`AnimatorImpl::updateBoneMatrices` は TransformManager から関節のワールド変換を読み戻す。PROGRESS 08-24 の項を参照）。これまでの「gltfio のスキニングには無効」という結論は、NO-OP store + 誤ったエンティティインデックスによる誤認でした。live-bone 経路（関節ローカル行列の書き込み → updateBoneMatrices）は、頭 yaw を単一の駆動源としてデバイス上で動作を検証済みです。ベイクは clip 再生の信頼できるチャンネルですが、live 駆動は軽量な代替であり、ポーズ/アニメーション/スプリングボーン/視線をすべてリアルタイムに駆動できます。
+- **VRoid/xlunar モデルのスケルトン根チェーン問題（解決済み、live 駆動）**：初期の gltfio は「独立スケルトン根 + 単一共有 skin」構造の関節ワールド行列を誤って計算していました。現在は **live VRMA 駆動**に変更済み——`AvatarRenderer.loadModel` は通常の GLB を読み込み、アニメーション/ポーズ/組み合わせはすべてリアルタイム VRMA プレイヤー + `TransformManager` によるボーン書き込み + `updateBoneMatrices()` で駆動します（公式サポートされたチャンネル）。**GLB ベイクなし・ModelNode 再構築なし・再ロードウィンドウなし**。ベイクチャンネル（`VrmaBake` / `loadModelWithClips` / `switchClip`）は削除済みです。
 - **Directional Light が MToon/トゥーン素材に無効（正しい挙動）**：VRoid/キャラクターモデルのマテリアルはすべて `KHR_materials_unlit` / MToon のトゥーン素材で、**方向光に反応しません**（トゥーン描画の特性で、xlunar/three-vrm も同様）。Scene タブの ambient + directional の 2 つのスライダーは現在**環境光（IndirectLight）の合計輝度として統合**し、画面の明暗を制御します：`合計輝度 = ambient*400k + dir*250k`。方向光を実際に有効にするにはマテリアルを PBR に変更する必要があります（トゥーン表現が崩れます）。
-- **lookAt（視線追従）はベイクアニメーションモードでは制限あり**：VRM lookAt には bone 型と expression 型があります。twist は bone 型です（head/eye ボーンを回転）。ベイク方式では **Animator が毎フレームすべてのボーンを管理するため、リアルタイムの lookAt によるボーン回転を重ねられません**。そのため lookAt はアニメーション/POSE 再生中は無効です（アニメーションなしの純 T-pose でも、TransformManager が gltfio のスキニングに対して無効なため同様に無効）。これはベイクアーキテクチャの固有の制約で、リアルタイム視線追従をサポートするには独立したボーンチャンネルが必要です。
-- **COMBOS（シーケンス編成）は一時的に無効**：シーケンス内で `loadPose` を連続実行（毎回ベイク + モデルの再ロード）すると、gltfio の `Animator::applyAnimation` で native SIGSEGV が発生することがあります（再ロードのウィンドウ期間に破棄済みの Animator へアクセス）。`applyLoaded` は「先に新規を作成し、後から旧を破棄」に変更して緩和しましたが、シーケンスレベルの連続発火はまだ不安定なため、一時的に無効にしています。
-- **アニメーション切替の繰り返しによるモデル再構築の競合（根治済み）**：`playAnimation` が `loadAnimation` を経由すると**毎回** 14MB の VRMA を再ベイク → 新規 Filament `ModelNode` + `AvatarEngineController` を作成 → 旧を破棄、という処理が走ります。1 回のシミュレーションで controller 再構築 8 回・ベイク 24 回が発生し、高頻度の破棄/再構築により、メインスレッド GC + Filament リソースの混乱、再構築ウィンドウ期間中の髪の rest ロック一時消失（髪が「レーザーのように飛び出す/顔に被る」）、Animator 並行書き込みによる偶発的な native SIGSEGV を引き起こしました。**解決策（08-24 より live 駆動に変更）**：ベイクしません。`AvatarRenderer.loadModel` は通常の GLB を読み込み、アニメーション/ポーズ/組み合わせはすべてリアルタイム VRMA プレイヤー + `TransformManager` によるボーン書き込み + `updateBoneMatrices()` で駆動します（live チャンネル、前述の 08-24 修正を参照）。GLB の再書き込みなし・ModelNode 再構築なし・再ロードのウィンドウ期間なしで、SIGSEGV は自然に発生しません。ベイクチャンネル（`VrmaBake` / `loadModelWithClips` / `switchClip`）は削除済みです。
+- **リアルタイム lookAt は live 経路で正常**：live プレイヤーは毎フレームワールド視線 quaternion を yaw/pitch に変換して VrmLookAt へ書き込み、リアルタイムに反映されます（ベイク方式の「Animator が全ボーンを管理する」制約は解消済み）。
+- スプリングボーンの衝突は 3 つの球体で近似（capsule は 2 点 + 半径）。three-vrm の挙動と一致します。
 
+## モデル切替後のポーズ崩れ：原因と対策（08-29 に原因を特定）
+
+### 現象
+- **初回ロード**では、どのモデルでもポーズが正しい（gltfio の bind pose、製作者がベイクした立ち姿勢）。
+- **モデルを 1 回切り替える**と（メイン demo のモデルセレクター、または `dev.vrm.runtime.demo.SWITCH` ブロードキャスト）、**新モデルの静止ポーズが歪む/崩れる**（手・脚が不自然で、特に大腿・腕で顕著）。ただし顔の大まかな向きは正しく、**そのモデルの VRMA アニメーションを再生するとポーズは正常**になる。
+
+### 原因（「書き込み失敗」ではなく「identity NLR がモデルの rest local へ書き戻される」）
+メイン demo のモデル切替エントリは、従来 `loadModel(新モデル)` の後に `avatar.execute(AvatarCommand.Reset)` を実行していました：
+
+- `Reset` → `AvatarEngineController.reset()` → `humanoid.resetNormalizedPose()`（55 個の**ノーマライズドリグボーンの quaternion をすべて identity にする**）→ `humanoid.update()`。
+- `update()` は VRM 1.0 の正規化リターゲット式でボーンのローカル回転を書き戻します：`PoseForB = L · W⁻¹ · NLR · W`。**NLR = identity** のときは `L · W⁻¹ · W = L` に退化し、各ボーンのローカル回転が **GLB 内の rest local rotation にそのまま書き戻されます**。
+- 問題点：**VRoid / xlunar 系モデルの rest は A-pose で、rest local に大きな回転が含まれます**（実測：VRoid_Sample_B/C の `J_Bip_L_UpperLeg` の rest local は X 軸回り ~170°、quat≈(0.996,-0.03,-0.026,0.08)）。一方 gltfio のスキニング/joint の親チェーンは独自に再計算した bind ツリーで、**GLB の rest の親チェーンとは一致しません**。「GLB rest local」を「gltfio の bind 親チェーン」に取り付けると、脚・腕のワールド向きがずれて、視覚的に「崩れて」見えます。
+
+ログによる裏付け（`AvatarEngine`）：
+- 切替後、`DIAG initial-rot-BEFORE-reset: leftUpperLeg=(1.00,-0.03,-0.03,0.08)` —— **まさに GLB rest local そのもの**（`glb_inspect`/単体テストで読み出した rest 値と完全に一致）。
+- 一方 `DIAG world:` の hips/feet の**ワールド座標は常に正常**（脚は y=0.14 で立位として妥当）—— DIAG はヘッドレスの `liveStore`（GLB の数学）を読んでおり、gltfio の実際のレンダリング値は読んでいないため。
+- `leftUpperLeg` は親（hips）のワールド回転に極めて敏感（L が X 軸回り 170°）で、親チェーンのずれが視覚的な大きなずれとして増幅されます。一方 arm の rest L は identity に近く親の回転に鈍感なため、手は見た目まともです。これが「なぜ脚の歪みが最も顕著か」を説明しています。
+- VRMA 再生中は毎フレーム**実際の非 identity の NLR** で上書き（リターゲット後の実際のポーズ）するため、親チェーンに誤差があっても相対回転として重なるだけで、視覚的に「抑え込まれて」→ アニメーションは正常に見えます。
+
+**結論：`avatar.reset()` / `resetNormalizedPose()` は、VRoid のような「非 T-pose rest + 大きなローカル回転」のモデルに対して危険**です。骨格を強制的に GLB rest local へ書き戻すため、gltfio の親チェーンと GLB が一致しないと骨格全体が歪みます。初回ロードでは reset しない（骨格は gltfio の bind pose を保持）ため正しく表示されます。
+
+### 採用中の対策（推奨、2026-08-29 適用済み）
+**メイン demo のモデル切替エントリでは `AvatarCommand.Reset` を呼ばず、gltfio の bind pose を保持します（初回ロードと同じ）。**
+- `app/.../VrmDemoScreen.kt` の 2 箇所（`SWITCH` ブロードキャスト分岐 + UI のモデル Tab クリック分岐）を修正し、`renderer.avatar?.execute(AvatarCommand.Reset)` を削除しました。
+- 効果：切替後は骨格が gltfio の bind pose（初回ロード時と同様）に留まり、立ち姿勢が自然になります。切替前に VRMA を再生していた場合は現在のアニメーションを継続したまま、ポーズも正常です。
+- 検証：実機で VRoid B/C / Seed-san などを切り替えても静止ポーズが正常。logcat に `EVENT reset` は出力されません。
+
+> 補足：手動の「ポーズをリセット」ボタン（`onReset`、`avatar?.reset()` を実行）は残しています。これはユーザーが明示的にトリガーするもので、モデル切替エントリには含まれないため、今回の変更の影響を受けません。
+
+### その他の選択肢（なぜ採用しないか）
+1. **切替後に `Reset` ではなく `SetPose("relaxed")` を使う**（demoPhone の方式）：`relaxed` は明示的な腕/立ち姿勢の数値（spine + left/rightUpperArm の rotZ ±78）で、**normalized チャンネルで明示的に上書き**するため、「各モデルの rest local への書き戻し」は行いません。「GLB rest local への書き戻し」という落とし穴を一切踏まないため、demoPhone ではこの問題が発生したことがありません。メイン demo は「切替後も各モデル製作者の立ち姿勢を残したい」ため上記の「採用中の対策」（bind pose 保持）を選んだので、こちらは使っていません。
+   - 利点：立ち姿勢が統一され、モデル間で一貫します。欠点：各モデル製作者の元の立ち姿勢の違いが失われるほか、`relaxed` は上半身のみを制御し脚は制御しない（脚は bind に依存）。
+2. **`resetNormalizedPose` の実質的な意味を「正規化 T-pose」に変更する**：identity NLR が書き戻す先を GLB rest local ではなく正規化 T-pose にする。そのためには `VRMHumanoidRig.update()` の rest 補正を改造する必要があります（例：`L·W⁻¹·N·W` が N=I のときに L に戻るのをやめ、normalized rig の rest 自体を T-pose にする）。これはより複雑なエンジン層の変更で、three-vrm の「consistent pose を rest へマッピングし直す」意味論とも矛盾し、リスクが高く効果が低い（モデル間の不整合は解消しない）ため、採用していません。
+3. **ルートチェーン整合の修正**：gltfio と GLB の**親チェーン/ルートチェーンを一致させる**（`Root→Global→Position→Hips` チェーンの適用を修正）。これで rest local への書き戻しも正しく表示されます。最も「根治」に近い方法ですが、gltfio 層でのスケルトンルート統合の修正が必要で、工数が大きくエンジン層の変更となるため、現時点では未実施です（現在の対策で要件を満たしている）。
+
+---
 
 - **VRoid の髪が「顔に被る」原因：lookAt による継続的な頭の回転 + ベイクした hair-lock がローカル rest のみをロック**。ベイクした clip には humanoid ボーンしか含まれず、スプリングボーン関節（VRoid_B の 47 本の HairJoint）は clip に含まれません。各 HairJoint の **rest ローカル回転**を一定の track（`hairLock_*`）としてベイクしたため、髪が大きな回転で「レーザーのように飛ばされる」ことはなくなりました。ただし HairJoint は `J_Bip_C_Head` の子なので、**head が回転すると髪は head のワールド向きを継承**します—— demoPhone が既定で有効にしている lookAt が毎フレーム head を円周運動させ（`target = head + 0.35·sin / 0.2·cos / +0.6`）、髪が head の揺れに合わせて断続的に顔に被ります。**demoPhone は現在 lookAt を既定で無効にしています（`PhoneViewModel.lookAtEnabled=false`）**。有効にするには、ベイク経路とは別の独立したボーンチャンネルを用意して髪の「ワールド向きのロック」を実現する必要があります。
 
